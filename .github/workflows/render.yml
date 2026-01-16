@@ -150,9 +150,9 @@ jobs:
 
             echo "Concatenating talking head + broll..."
             cat > work/concat_all.txt <<'CONCAT_EOF'
-file seg_th.mp4
-file seg_broll.mp4
-CONCAT_EOF
+          file seg_th.mp4
+          file seg_broll.mp4
+          CONCAT_EOF
 
             cd work
             ffmpeg -y -f concat -safe 0 -i concat_all.txt -c copy stack.mp4
@@ -162,67 +162,67 @@ CONCAT_EOF
           fi
 
           echo "Generating captions..."
-          cat > generate_captions.py <<'PYTHON_EOF'
-import json, math
+          cat > generate_captions.py <<'PYEOF'
+          import json, math
 
-payload = json.load(open("payload.json","r",encoding="utf-8"))
-lines = payload.get("script_lines") or []
-audio_dur = payload.get("audioDurationSec") or payload.get("audio_duration")
-try:
-  audio_dur = float(audio_dur) if audio_dur is not None else None
-except Exception:
-  audio_dur = None
+          payload = json.load(open("payload.json","r",encoding="utf-8"))
+          lines = payload.get("script_lines") or []
+          audio_dur = payload.get("audioDurationSec") or payload.get("audio_duration")
+          try:
+            audio_dur = float(audio_dur) if audio_dur is not None else None
+          except Exception:
+            audio_dur = None
 
-if not audio_dur or audio_dur < 1:
-  audio_dur = 1.0
+          if not audio_dur or audio_dur < 1:
+            audio_dur = 1.0
 
-lines = [str(x).strip() for x in lines if str(x).strip()]
-if not lines:
-  lines = [""]
+          lines = [str(x).strip() for x in lines if str(x).strip()]
+          if not lines:
+            lines = [""]
 
-def ass_time(t):
-  h = int(t // 3600)
-  t -= h*3600
-  m = int(t // 60)
-  t -= m*60
-  s = int(t)
-  cs = int(round((t - s) * 100))
-  return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+          def ass_time(t):
+            h = int(t // 3600)
+            t -= h*3600
+            m = int(t // 60)
+            t -= m*60
+            s = int(t)
+            cs = int(round((t - s) * 100))
+            return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
-W = int(payload.get("width") or 1080)
-H = int(payload.get("height") or 1920)
+          W = int(payload.get("width") or 1080)
+          H = int(payload.get("height") or 1920)
 
-x = W // 2
-y = int(H * 0.67)
+          x = W // 2
+          y = int(H * 0.67)
 
-n = len(lines)
-slot = audio_dur / n
+          n = len(lines)
+          slot = audio_dur / n
 
-ass = []
-ass.append("[Script Info]")
-ass.append("ScriptType: v4.00+")
-ass.append(f"PlayResX: {W}")
-ass.append(f"PlayResY: {H}")
-ass.append("")
-ass.append("[V4+ Styles]")
-ass.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
-ass.append("Style: Default,Arial,44,&H00FFFFFF,&H000000FF,&H00111111,&H80000000,0,0,0,0,100,100,0,0,3,3,0,2,70,70,50,1")
-ass.append("")
-ass.append("[Events]")
-ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+          ass = []
+          ass.append("[Script Info]")
+          ass.append("ScriptType: v4.00+")
+          ass.append(f"PlayResX: {W}")
+          ass.append(f"PlayResY: {H}")
+          ass.append("")
+          ass.append("[V4+ Styles]")
+          ass.append("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding")
+          ass.append("Style: Default,Arial,44,&H00FFFFFF,&H000000FF,&H00111111,&H80000000,0,0,0,0,100,100,0,0,3,3,0,2,70,70,50,1")
+          ass.append("")
+          ass.append("[Events]")
+          ass.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
 
-for i, text in enumerate(lines):
-  start = i * slot
-  end = min(audio_dur, (i+1) * slot)
-  if end <= start:
-    end = start + 0.4
-  text = text.replace("\\","\\\\").replace("{","\\{").replace("}","\\}")
-  override = f"{{\\an2\\pos({x},{y})\\fad(80,80)}}"
-  ass.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{override}{text}")
+          for i, text in enumerate(lines):
+            start = i * slot
+            end = min(audio_dur, (i+1) * slot)
+            if end <= start:
+              end = start + 0.4
+            text = text.replace("\\","\\\\").replace("{","\\{").replace("}","\\}")
+            override = f"{{\\an2\\pos({x},{y})\\fad(80,80)}}"
+            ass.append(f"Dialogue: 0,{ass_time(start)},{ass_time(end)},Default,,0,0,0,,{override}{text}")
 
-open("work/captions.ass","w",encoding="utf-8").write("\n".join(ass))
-print("Wrote work/captions.ass with", len(lines), "lines")
-PYTHON_EOF
+          open("work/captions.ass","w",encoding="utf-8").write("\n".join(ass))
+          print("Wrote work/captions.ass with", len(lines), "lines")
+          PYEOF
 
           python3 generate_captions.py
 
