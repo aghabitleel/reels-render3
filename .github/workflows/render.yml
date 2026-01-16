@@ -398,7 +398,6 @@ jobs:
               for ((k=i; k<chunk_end; k++)); do
                 word="${WORDS[k]}"
 
-                # Escape ONLY inside the word text (do not break ASS tags)
                 esc="$(printf '%s' "$word" | sed -e 's/\\/\\\\/g' -e 's/{/\\{/g' -e 's/}/\\}/g')"
 
                 if [ $k -eq $j ]; then
@@ -412,7 +411,9 @@ jobs:
                 fi
               done
 
-              printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4\\fad(80,80)}%s\n' \
+              # CHANGE: remove per-word fade to stop "blinking"
+              # Keep rest of formatting the same (position, blur, colors).
+              printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4}%s\n' \
                 "$s_str" "$e_str" "$CAPTION_X" "$CAPTION_Y" "$text" >> subs.ass
 
               i_word_start=$word_end
