@@ -367,7 +367,8 @@ jobs:
             full_text=""
             for ((k=i; k<chunk_end; k++)); do
               word="${WORDS[k]}"
-              esc="${word//\{/\\{}"
+              esc="${word//\\/\\\\}"
+              esc="${esc//\{/\\{}"
               esc="${esc//\}/\\}}"
               full_text="${full_text}${esc}"
               if [ $k -lt $((chunk_end - 1)) ]; then
@@ -424,7 +425,8 @@ jobs:
               text=""
               for ((k=i; k<chunk_end; k++)); do
                 word="${WORDS[k]}"
-                esc="${word//\{/\\{}"
+                esc="${word//\\/\\\\}"
+                esc="${esc//\{/\\{}"
                 esc="${esc//\}/\\}}"
 
                 if [ $k -eq $j ]; then
