@@ -399,9 +399,7 @@ jobs:
                 word="${WORDS[k]}"
 
                 # Escape ONLY inside the word text (do not break ASS tags)
-                esc="${word//\\/\\\\}"
-                esc="${esc//\{/\\{}"
-                esc="${esc//\}/\\}}"
+                esc="$(printf '%s' "$word" | sed -e 's/\\/\\\\/g' -e 's/{/\\{/g' -e 's/}/\\}/g')"
 
                 if [ $k -eq $j ]; then
                   text="${text}{\\c&H00FFFF&}${esc}{\\c&HFFFFFF&}"
