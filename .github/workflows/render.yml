@@ -213,28 +213,23 @@ jobs:
 
           AUDIO_DUR=$(cat audio_dur.txt)
           
-          # Get talking head duration
           TH_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "norm_talking_head.mp4" || echo "0")
           
-          # Truncate talking head to audio duration if needed
           if awk "BEGIN {exit !($TH_DUR > $AUDIO_DUR)}"; then
             TH_DUR=$AUDIO_DUR
           fi
           
           echo "Talking head: ${TH_DUR}s, Audio: ${AUDIO_DUR}s"
           
-          # Create talking head segment
           ffmpeg -y -i "norm_talking_head.mp4" -t "$TH_DUR" \
             -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
             "seg_talking_head.mp4"
           
-          # Calculate remaining time for broll
           REMAIN=$(awk -v a="$AUDIO_DUR" -v t="$TH_DUR" 'BEGIN {r=a-t; if(r<0)r=0; print r}')
           
           echo "Remaining time for broll: ${REMAIN}s"
           
           if awk "BEGIN {exit !($REMAIN > 0)}"; then
-            # Build broll sequence
             CHUNKS=$(awk -v r="$REMAIN" -v c="$CHUNK_SEC" 'BEGIN {print int(r/c + 0.999999)}')
             if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
             
@@ -261,49 +256,47 @@ jobs:
               echo "file broll_chunk_${n}.mp4" >> concat_broll.txt
             done
             
-            # Concat broll chunks
             ffmpeg -y -f concat -safe 0 -i concat_broll.txt -c copy broll_seq_raw.mp4
             
-            # Truncate to exact remaining time
             ffmpeg -y -i broll_seq_raw.mp4 -t "$REMAIN" \
               -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
               "seg_broll.mp4"
             
-            # Concat talking head + broll
-            cat > concat_all.txt <<EOF
-file seg_talking_head.mp4
-file seg_broll.mp4
-EOF
+            cat > concat_all.txt <<'CONCAT_EOF'
+          file seg_talking_head.mp4
+          file seg_broll.mp4
+          CONCAT_EOF
             
             ffmpeg -y -f concat -safe 0 -i concat_all.txt -c copy stack.mp4
           else
-            # No broll needed, just use talking head
             cp seg_talking_head.mp4 stack.mp4
           fi
 
-      - name: Build TikTok / Reels style ASS transcription (word-by-word highlight)
+      - name: Build TikTok style ASS transcription
         shell: bash
         run: |
           set -euo pipefail
 
           if [ ! -s script.txt ]; then
             echo "No script.txt, skipping subtitles."
-            : > subs.missing
+            touch subs.missing
             exit 0
           fi
 
-          TOTAL_SEC="$(cat audio_dur.txt)"
+          TOTAL_SEC=$(cat audio_dur.txt)
           TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '\n' ' ' | sed 's/  */ /g')
+          
           if [ -z "$TEXT" ]; then
             echo "script.txt has no content, skipping subtitles."
-            : > subs.missing
+            touch subs.missing
             exit 0
           fi
 
           mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
+          
           if [ "${#WORDS[@]}" -eq 0 ]; then
             echo "No words found, skipping subtitles."
-            : > subs.missing
+            touch subs.missing
             exit 0
           fi
 
@@ -316,33 +309,27 @@ EOF
             total_chars=$(( total_chars + c ))
           done
 
-          fmt_time () {
-            awk -v t="$1" 'BEGIN{
-              if (t<0) t=0;
-              h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
-              cs=int((s - int(s))*100);
-              printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
-            }'
-          }
-
           CAPTION_X=$((WIDTH / 2))
           CAPTION_Y=$((HEIGHT / 2))
 
-          : > subs.ass
-          printf '%s\n' \
-            '[Script Info]' \
-            'ScriptType: v4.00+' \
-            "PlayResX: ${WIDTH}" \
-            "PlayResY: ${HEIGHT}" \
-            'WrapStyle: 2' \
-            'ScaledBorderAndShadow: yes' \
-            '' \
-            '[V4+ Styles]' \
-            'Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding' \
-            'Style: Reels,DejaVu Sans Bold,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,6,2,5,60,60,20,1' \
-            '' \
-            '[Events]' \
-            'Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text' >> subs.ass
+          cat > subs.ass <<'ASS_HEADER'
+          [Script Info]
+          ScriptType: v4.00+
+          PlayResX: 1080
+          PlayResY: 1920
+          WrapStyle: 2
+          ScaledBorderAndShadow: yes
+
+          [V4+ Styles]
+          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+          Style: Reels,DejaVu Sans Bold,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,6,2,5,60,60,20,1
+
+          [Events]
+          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+          ASS_HEADER
+
+          sed -i "s/PlayResX: 1080/PlayResX: ${WIDTH}/" subs.ass
+          sed -i "s/PlayResY: 1920/PlayResY: ${HEIGHT}/" subs.ass
 
           start=0
           MIN_DURATION=0.28
@@ -380,16 +367,27 @@ EOF
             full_text=""
             for ((k=i; k<chunk_end; k++)); do
               word="${WORDS[k]}"
-              esc="${word//'{'/'\{'}"
-              esc="${esc//'}'/'\}'}"
+              esc="${word//\{/\\{}"
+              esc="${esc//\}/\\}}"
               full_text="${full_text}${esc}"
               if [ $k -lt $((chunk_end - 1)) ]; then
                 full_text="${full_text} "
               fi
             done
 
-            chunk_s_str=$(fmt_time "$chunk_start_time")
-            chunk_e_str=$(fmt_time "$chunk_end_time")
+            chunk_s_str=$(awk -v t="$chunk_start_time" 'BEGIN{
+              if (t<0) t=0;
+              h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
+              cs=int((s - int(s))*100);
+              printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
+            }')
+            
+            chunk_e_str=$(awk -v t="$chunk_end_time" 'BEGIN{
+              if (t<0) t=0;
+              h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
+              cs=int((s - int(s))*100);
+              printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
+            }')
 
             printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4\\fad(80,80)}%s\n' \
               "$chunk_s_str" "$chunk_e_str" "$CAPTION_X" "$CAPTION_Y" "$full_text" >> subs.ass
@@ -409,14 +407,25 @@ EOF
                 word_end=$chunk_end_time
               fi
 
-              s_str=$(fmt_time "$word_start")
-              e_str=$(fmt_time "$word_end")
+              s_str=$(awk -v t="$word_start" 'BEGIN{
+                if (t<0) t=0;
+                h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
+                cs=int((s - int(s))*100);
+                printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
+              }')
+              
+              e_str=$(awk -v t="$word_end" 'BEGIN{
+                if (t<0) t=0;
+                h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
+                cs=int((s - int(s))*100);
+                printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
+              }')
 
               text=""
               for ((k=i; k<chunk_end; k++)); do
                 word="${WORDS[k]}"
-                esc="${word//'{'/'\{'}"
-                esc="${esc//'}'/'\}'}"
+                esc="${word//\{/\\{}"
+                esc="${esc//\}/\\}}"
 
                 if [ $k -eq $j ]; then
                   text="${text}{\\c&H00FFFF&}${esc}{\\c&H00FFFFFF&}"
