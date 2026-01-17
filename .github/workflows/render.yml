@@ -1,60 +1,51 @@
+name: Render Reel
+
+on:
+  repository_dispatch:
+    types: [render_reel]
+  workflow_dispatch: {}
+
 jobs:
   render:
     runs-on: ubuntu-latest
-    env:
-      LC_ALL: C
 
     steps:
-      - name: Set up FFmpeg
-        uses: FedericoCarboni/setup-ffmpeg@v2
-        with:
-          version: latest
-
-      - name: Install jq and curl
+      - name: Install dependencies
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y ffmpeg jq curl
 
-      - name: Capture payload safely
+      - name: Save payload
         shell: bash
         run: |
           set -euo pipefail
           cat > payload.json <<'JSON'
           ${{ toJson(github.event.client_payload) }}
           JSON
-          echo "Captured payload:"
+          echo "Payload:"
           cat payload.json
 
-      - name: Read and validate params
-        id: params
+      - name: Read params
         shell: bash
         run: |
           set -euo pipefail
 
-          RAW_AUDIO_URL=$(jq -r 'try .audio_url // ""' payload.json)
-          VIDEO_URL=$(jq -r 'try .layout_config.video_url // ""' payload.json)
+          VIDEO_URL=$(jq -r '.layout_config.video_url // empty' payload.json)
+          OUT_NAME=$(jq -r '.out_name // "ambient_30min.mp4"' payload.json)
 
-          OUT_NAME=$(jq -r 'try .out_name // "ambient_30min.mp4"' payload.json)
+          WIDTH=$(jq -r '.width // 1920' payload.json)
+          HEIGHT=$(jq -r '.height // 1080' payload.json)
+          FPS=$(jq -r '.fps // 30' payload.json)
+          TARGET_MINUTES=$(jq -r '.target_minutes // 30' payload.json)
+          XFADE_SEC=$(jq -r '.xfade_sec // 0.35' payload.json)
 
-          WIDTH=$(jq -r 'try .width // 1920' payload.json)
-          HEIGHT=$(jq -r 'try .height // 1080' payload.json)
-          FPS=$(jq -r 'try .fps // 30' payload.json)
-
-          TARGET_MINUTES=$(jq -r 'try .target_minutes // 30' payload.json)
-          XFADE_SEC=$(jq -r 'try .xfade_sec // 0.35' payload.json)
-
-          if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
-          if [ "$VIDEO_URL" = "null" ]; then VIDEO_URL=""; fi
-
-          if [ -z "$VIDEO_URL" ] || ! echo "$VIDEO_URL" | grep -Eiq '^https?://'; then
-            echo "Error: client_payload.layout_config.video_url is missing or invalid"
-            cat payload.json
+          if [ -z "${VIDEO_URL:-}" ]; then
+            echo "ERROR: Missing layout_config.video_url"
             exit 1
           fi
 
-          echo "AUDIO_URL=$RAW_AUDIO_URL" >> $GITHUB_ENV
           echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "WIDTH=$WIDTH" >> $GITHUB_ENV
@@ -63,94 +54,28 @@ jobs:
           echo "TARGET_MINUTES=$TARGET_MINUTES" >> $GITHUB_ENV
           echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
 
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps target=${TARGET_MINUTES}min xfade=${XFADE_SEC}s"
-
-      - name: Validate video URLs list
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -z "${VIDEO_URL:-}" ] || ! echo "$VIDEO_URL" | grep -Eiq '^https?://'; then
-            echo "Error: VIDEO_URL is missing or invalid"
-            cat payload.json
-            exit 1
-          fi
-          echo "Single video mode. Video URL present."
-
-      - name: Download audio
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
-
-          if [ -n "${AUDIO_URL:-}" ] && echo "$AUDIO_URL" | grep -Eiq '^https?://'; then
-            UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-            echo "Downloading audio: ${AUDIO_URL:0:70}..."
-            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
-            ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
-          else
-            echo "No audio_url, generating silent audio for ${TARGET_MINUTES} minutes"
-            ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
-              -t "$TARGET_SEC" \
-              -c:a aac -b:a 192k audio.m4a
-          fi
-
-      - name: Get audio duration (float)
-        id: dur
-        shell: bash
-        run: |
-          set -euo pipefail
-          DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "1800")
-          if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR="1800"; fi
-          echo "dur=$DUR" >> $GITHUB_OUTPUT
-          echo "Audio duration (s): $DUR"
-          printf "%s" "$DUR" > audio_dur.txt
-
-      - name: Download videos (talking_head_then_broll mode)
+      - name: Download video
         shell: bash
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
+          curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$VIDEO_URL" -o source.mp4
 
-          echo "Downloading single video: $VIDEO_URL"
-          curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$VIDEO_URL" -o "source.mp4" || {
-            echo "ERROR: Failed to download video"
-            exit 1
-          }
-
-          echo "Download complete"
-          ls -lh source.mp4 || true
-
-      - name: Normalize talking head (9:16 portrait)
+      - name: Normalize video
         shell: bash
         run: |
           set -euo pipefail
-          echo "Normalizing video to ${WIDTH}x${HEIGHT} (landscape)"
-          ffmpeg -y -i "source.mp4" \
+          ffmpeg -y -i source.mp4 \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-            -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm.mp4"
+            -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) norm.mp4
 
-      - name: Normalize broll clips (9:16 portrait)
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "No broll normalization needed in single video loop mode."
-
-      - name: Create talking_head_then_broll sequence
+      - name: Create looped video (30 minutes)
         shell: bash
         run: |
           set -euo pipefail
 
           TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
-          CLIP_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 norm.mp4 || echo "0")
-          if [ -z "$CLIP_DUR" ] || [ "$CLIP_DUR" = "N/A" ]; then CLIP_DUR="0"; fi
-
-          if awk "BEGIN {exit !($CLIP_DUR > 1.0)}"; then
-            echo "Clip duration: $CLIP_DUR sec"
-          else
-            echo "Error: norm.mp4 duration invalid: $CLIP_DUR"
-            exit 1
-          fi
+          CLIP_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 norm.mp4)
 
           XFADE=$(awk -v x="$XFADE_SEC" -v d="$CLIP_DUR" 'BEGIN{
             max=d*0.25;
@@ -167,18 +92,11 @@ jobs:
             print n;
           }')
 
-          echo "Target: ${TARGET_SEC}s, clip: ${CLIP_DUR}s, xfade: ${XFADE}s, repeats: ${N}"
-
           INPUTS=()
-          for i in $(seq 1 "$N"); do
-            INPUTS+=(-i norm.mp4)
-          done
+          for i in $(seq 1 "$N"); do INPUTS+=(-i norm.mp4); done
 
-          FILTER=""
-          FILTER+="[0:v]setpts=PTS-STARTPTS[v0];"
-          for i in $(seq 1 $((N-1))); do
-            FILTER+="[$i:v]setpts=PTS-STARTPTS[v$i];"
-          done
+          FILTER="[0:v]setpts=PTS-STARTPTS[v0];"
+          for i in $(seq 1 $((N-1))); do FILTER+="[$i:v]setpts=PTS-STARTPTS[v$i];"; done
 
           OFFSET=$(awk -v d="$CLIP_DUR" -v x="$XFADE" 'BEGIN{printf("%.3f", d-x)}')
           FILTER+="[v0][v1]xfade=transition=fade:duration=${XFADE}:offset=${OFFSET}[x1];"
@@ -200,27 +118,80 @@ jobs:
             -map "[$LAST]" \
             -t "$TARGET_SEC" \
             -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-            -movflags +faststart \
-            stack.mp4
+            -movflags +faststart loop_video.mp4
 
-      - name: Build TikTok style ASS transcription
+      - name: Download and build looped audio from audio_urls
         shell: bash
         run: |
           set -euo pipefail
-          echo "Skipping subtitles for ambient landscape video."
-          touch subs.missing
+          UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
+          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
 
-      - name: Burn subtitles and mux audio
+          jq -r 'try .audio_urls // [] | .[]' payload.json > audio_urls.txt || true
+
+          if [ ! -s audio_urls.txt ]; then
+            echo "No audio_urls provided, generating silence"
+            ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
+              -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+            exit 0
+          fi
+
+          i=0
+          while IFS= read -r url; do
+            [ -z "$url" ] && continue
+            i=$((i+1))
+            if [ "$i" -gt 12 ]; then break; fi
+
+            echo "Downloading audio $i: $url"
+            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$url" -o "a${i}.bin"
+
+            # Convert to wav for stable concatenation
+            ffmpeg -y -i "a${i}.bin" -vn -ac 2 -ar 48000 -c:a pcm_s16le "a${i}.wav"
+          done < audio_urls.txt
+
+          COUNT=$(ls -1 a*.wav 2>/dev/null | wc -l | tr -d ' ')
+          if [ "$COUNT" -lt 1 ]; then
+            echo "No valid audio downloaded, generating silence"
+            ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
+              -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+            exit 0
+          fi
+
+          # Create one playlist wav by concatenation with crossfades
+          if [ "$COUNT" -eq 1 ]; then
+            ffmpeg -y -stream_loop -1 -i a1.wav -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+            exit 0
+          fi
+
+          INPUTS=()
+          for n in $(seq 1 "$COUNT"); do INPUTS+=(-i "a${n}.wav"); done
+
+          FILTER=""
+          for n in $(seq 0 $((COUNT-1))); do
+            FILTER+="[$n:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[a$n];"
+          done
+
+          FILTER+="[a0][a1]acrossfade=d=1:c1=tri:c2=tri[m1];"
+          if [ "$COUNT" -gt 2 ]; then
+            for n in $(seq 2 $((COUNT-1))); do
+              FILTER+="[m$((n-1))][a$n]acrossfade=d=1:c1=tri:c2=tri[m$n];"
+            done
+            LAST="m$((COUNT-1))"
+          else
+            LAST="m1"
+          fi
+
+          ffmpeg -y "${INPUTS[@]}" -filter_complex "$FILTER" -map "[$LAST]" playlist.wav
+          ffmpeg -y -stream_loop -1 -i playlist.wav -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+
+      - name: Mux video + audio
         shell: bash
         run: |
           set -euo pipefail
-
-          ffmpeg -y -i stack.mp4 -i audio.m4a \
-            -map 0:v:0 -map 1:a:0 \
-            -shortest \
-            -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
-            -c:a aac -b:a 192k \
-            -movflags +faststart "$OUT_NAME"
+          ffmpeg -y -i loop_video.mp4 -i audio.m4a \
+            -map 0:v:0 -map 1:a:0 -shortest \
+            -c:v copy -c:a aac -b:a 192k \
+            -movflags +faststart "${OUT_NAME}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
