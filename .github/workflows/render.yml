@@ -1,48 +1,52 @@
-name: Render Reel
+name: render
 
 on:
   repository_dispatch:
     types: [render_reel]
-  workflow_dispatch: {}
+
+permissions:
+  contents: read
 
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Install dependencies
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq curl
+          sudo apt-get install -y jq ffmpeg curl
 
-      - name: Save payload
+      - name: Write payload to file
         shell: bash
         run: |
           set -euo pipefail
           cat > payload.json <<'JSON'
           ${{ toJson(github.event.client_payload) }}
           JSON
-          echo "Payload:"
-          cat payload.json
 
-      - name: Read params
+      - name: Extract variables
         shell: bash
         run: |
           set -euo pipefail
 
-          VIDEO_URL=$(jq -r '.layout_config.video_url // empty' payload.json)
-          OUT_NAME=$(jq -r '.out_name // "ambient_30min.mp4"' payload.json)
+          VIDEO_URL="$(jq -r '.layout_config.video_url // empty' payload.json)"
+          OUT_NAME="$(jq -r '.out_name // "output.mp4"' payload.json)"
+          WIDTH="$(jq -r '.width // 1920' payload.json)"
+          HEIGHT="$(jq -r '.height // 1080' payload.json)"
+          FPS="$(jq -r '.fps // 30' payload.json)"
+          TARGET_MINUTES="$(jq -r '.target_minutes // 30' payload.json)"
+          XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
 
-          WIDTH=$(jq -r '.width // 1920' payload.json)
-          HEIGHT=$(jq -r '.height // 1080' payload.json)
-          FPS=$(jq -r '.fps // 30' payload.json)
-          TARGET_MINUTES=$(jq -r '.target_minutes // 30' payload.json)
-          XFADE_SEC=$(jq -r '.xfade_sec // 0.35' payload.json)
-
-          if [ -z "${VIDEO_URL:-}" ]; then
-            echo "ERROR: Missing layout_config.video_url"
+          if [ -z "$VIDEO_URL" ]; then
+            echo "Missing layout_config.video_url in payload.json"
+            cat payload.json
             exit 1
           fi
 
@@ -69,7 +73,7 @@ jobs:
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
             -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) norm.mp4
 
-      - name: Create looped video (30 minutes)
+      - name: Create looped video
         shell: bash
         run: |
           set -euo pipefail
@@ -138,15 +142,34 @@ jobs:
 
           i=0
           while IFS= read -r url; do
+            url="$(echo "$url" | tr -d '\r' | xargs || true)"
             [ -z "$url" ] && continue
+
+            if [[ "$url" == //* ]]; then
+              url="https:${url}"
+            fi
+
+            if [[ "$url" != https://* ]]; then
+              echo "Skipping non-https url: $url"
+              continue
+            fi
+
             i=$((i+1))
             if [ "$i" -gt 12 ]; then break; fi
 
             echo "Downloading audio $i: $url"
-            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$url" -o "a${i}.bin"
+            if ! curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$url" -o "a${i}.bin"; then
+              echo "Failed to download $url, skipping"
+              i=$((i-1))
+              continue
+            fi
 
-            # Convert to wav for stable concatenation
-            ffmpeg -y -i "a${i}.bin" -vn -ac 2 -ar 48000 -c:a pcm_s16le "a${i}.wav"
+            if ! ffmpeg -y -i "a${i}.bin" -vn -ac 2 -ar 48000 -c:a pcm_s16le "a${i}.wav"; then
+              echo "ffmpeg failed for a${i}.bin, skipping"
+              rm -f "a${i}.bin"
+              i=$((i-1))
+              continue
+            fi
           done < audio_urls.txt
 
           COUNT=$(ls -1 a*.wav 2>/dev/null | wc -l | tr -d ' ')
@@ -157,7 +180,6 @@ jobs:
             exit 0
           fi
 
-          # Create one playlist wav by concatenation with crossfades
           if [ "$COUNT" -eq 1 ]; then
             ffmpeg -y -stream_loop -1 -i a1.wav -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
             exit 0
