@@ -1,12 +1,3 @@
-name: Render Reel
-
-on:
-  repository_dispatch:
-    types: [render_reel]
-
-permissions:
-  contents: write
-
 jobs:
   render:
     runs-on: ubuntu-latest
@@ -43,88 +34,74 @@ jobs:
           set -euo pipefail
 
           RAW_AUDIO_URL=$(jq -r 'try .audio_url // ""' payload.json)
-          OUT_NAME=$(jq -r 'try .out_name // "reel.mp4"' payload.json)
-          WIDTH=$(jq -r 'try .width // 1080' payload.json)
-          HEIGHT=$(jq -r 'try .height // 1920' payload.json)
+          VIDEO_URL=$(jq -r 'try .layout_config.video_url // ""' payload.json)
+
+          OUT_NAME=$(jq -r 'try .out_name // "ambient_30min.mp4"' payload.json)
+
+          WIDTH=$(jq -r 'try .width // 1920' payload.json)
+          HEIGHT=$(jq -r 'try .height // 1080' payload.json)
           FPS=$(jq -r 'try .fps // 30' payload.json)
-          CHUNK_SEC=$(jq -r 'try .chunk_sec // 4' payload.json)
-          MAX_CLIPS=$(jq -r 'try .max_clips // 100' payload.json)
-          LAYOUT_TYPE=$(jq -r 'try .layout_config.type // "talking_head_then_broll"' payload.json)
-          TH_SPEED=$(jq -r 'try .layout_config.talking_head_speed // 1.0' payload.json)
+
+          TARGET_MINUTES=$(jq -r 'try .target_minutes // 30' payload.json)
+          XFADE_SEC=$(jq -r 'try .xfade_sec // 0.35' payload.json)
 
           if [ "$RAW_AUDIO_URL" = "null" ]; then RAW_AUDIO_URL=""; fi
-          if [ "$TH_SPEED" = "null" ] || [ -z "$TH_SPEED" ]; then TH_SPEED=1.0; fi
+          if [ "$VIDEO_URL" = "null" ]; then VIDEO_URL=""; fi
 
-          if [ -z "$RAW_AUDIO_URL" ] || ! echo "$RAW_AUDIO_URL" | grep -Eiq '^https?://'; then
-            echo "Error: client_payload.audio_url is missing or invalid"
+          if [ -z "$VIDEO_URL" ] || ! echo "$VIDEO_URL" | grep -Eiq '^https?://'; then
+            echo "Error: client_payload.layout_config.video_url is missing or invalid"
             cat payload.json
             exit 1
           fi
 
-          jq -r '
-            if (.script_lines | type == "array") then
-              .script_lines | map(tostring) | join("\n")
-            elif (.script_text | type == "string") then
-              .script_text
-            else
-              ""
-            end
-          ' payload.json > script.txt
-
           echo "AUDIO_URL=$RAW_AUDIO_URL" >> $GITHUB_ENV
+          echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "WIDTH=$WIDTH" >> $GITHUB_ENV
           echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
           echo "FPS=$FPS" >> $GITHUB_ENV
-          echo "CHUNK_SEC=$CHUNK_SEC" >> $GITHUB_ENV
-          echo "MAX_CLIPS=$MAX_CLIPS" >> $GITHUB_ENV
-          echo "LAYOUT_TYPE=$LAYOUT_TYPE" >> $GITHUB_ENV
-          echo "TH_SPEED=$TH_SPEED" >> $GITHUB_ENV
+          echo "TARGET_MINUTES=$TARGET_MINUTES" >> $GITHUB_ENV
+          echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
 
-          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps chunk=${CHUNK_SEC}s layout=$LAYOUT_TYPE speed=$TH_SPEED"
+          echo "Params: $OUT_NAME ${WIDTH}x${HEIGHT} ${FPS}fps target=${TARGET_MINUTES}min xfade=${XFADE_SEC}s"
 
       - name: Validate video URLs list
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$LAYOUT_TYPE" = "talking_head_then_broll" ]; then
-            TH_URL=$(jq -r 'try .layout_config.talking_head_url // ""' payload.json)
-            BROLL_COUNT=$(jq -r 'try (.layout_config.broll_videos | length) // 0' payload.json)
-            if [ -z "$TH_URL" ] || [ "$BROLL_COUNT" -lt 1 ]; then
-              echo "Error: talking_head_then_broll requires talking_head_url and broll_videos"
-              cat payload.json
-              exit 1
-            fi
-            echo "Layout: talking head + $BROLL_COUNT broll videos"
-          else
-            COUNT=$(jq -r 'try (.video_urls | length) // 0' payload.json)
-            if [ "$COUNT" -lt 1 ]; then
-              echo "Error: client_payload.video_urls is empty"
-              cat payload.json
-              exit 1
-            fi
-            echo "Video URL count in payload: $COUNT"
+          if [ -z "${VIDEO_URL:-}" ] || ! echo "$VIDEO_URL" | grep -Eiq '^https?://'; then
+            echo "Error: VIDEO_URL is missing or invalid"
+            cat payload.json
+            exit 1
           fi
+          echo "Single video mode. Video URL present."
 
       - name: Download audio
         shell: bash
         run: |
           set -euo pipefail
-          UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          echo "Audio URL starts with: ${AUDIO_URL:0:70}..."
-          curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
-          ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
+
+          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
+
+          if [ -n "${AUDIO_URL:-}" ] && echo "$AUDIO_URL" | grep -Eiq '^https?://'; then
+            UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
+            echo "Downloading audio: ${AUDIO_URL:0:70}..."
+            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$AUDIO_URL" -o audio.bin
+            ffmpeg -y -i audio.bin -c:a aac -b:a 192k -movflags +faststart audio.m4a
+          else
+            echo "No audio_url, generating silent audio for ${TARGET_MINUTES} minutes"
+            ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
+              -t "$TARGET_SEC" \
+              -c:a aac -b:a 192k audio.m4a
+          fi
 
       - name: Get audio duration (float)
         id: dur
         shell: bash
         run: |
           set -euo pipefail
-          DUR=$(ffprobe -v error -select_streams a:0 -show_entries stream=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "")
-          if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then
-            DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "60")
-          fi
-          if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR="60"; fi
+          DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 audio.m4a || echo "1800")
+          if [ -z "$DUR" ] || [ "$DUR" = "N/A" ]; then DUR="1800"; fi
           echo "dur=$DUR" >> $GITHUB_OUTPUT
           echo "Audio duration (s): $DUR"
           printf "%s" "$DUR" > audio_dur.txt
@@ -135,310 +112,114 @@ jobs:
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
 
-          if [ "$LAYOUT_TYPE" = "talking_head_then_broll" ]; then
-            echo "=== Downloading TALKING HEAD ==="
-            TH_URL=$(jq -r '.layout_config.talking_head_url' payload.json)
-            echo "Downloading talking head: $TH_URL"
-            curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$TH_URL" -o "talking_head.mp4" || {
-              echo "ERROR: Failed to download talking head"
-              exit 1
-            }
-
-            echo "=== Downloading BROLL videos ==="
-            i=0
-            jq -r '.layout_config.broll_videos[]' payload.json | while read -r URL; do
-              i=$((i+1))
-              [ $i -le $MAX_CLIPS ] || break
-              echo "Downloading broll $i: $URL"
-              curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "broll_${i}.mp4" || echo "WARN failed $URL"
-            done
-          else
-            echo "=== Downloading videos (single mode) ==="
-            i=0
-            jq -r '[.video_urls] | flatten | unique[]' payload.json | while read -r URL; do
-              i=$((i+1))
-              [ $i -le $MAX_CLIPS ] || break
-              echo "Downloading $i: $URL"
-              curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$URL" -o "in_${i}.mp4" || echo "WARN failed $URL"
-            done
-          fi
+          echo "Downloading single video: $VIDEO_URL"
+          curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$VIDEO_URL" -o "source.mp4" || {
+            echo "ERROR: Failed to download video"
+            exit 1
+          }
 
           echo "Download complete"
-          ls -lh *.mp4 2>/dev/null || true
+          ls -lh source.mp4 || true
 
       - name: Normalize talking head (9:16 portrait)
         shell: bash
         run: |
           set -euo pipefail
-          
-          if [ "$LAYOUT_TYPE" = "talking_head_then_broll" ] && [ -f "talking_head.mp4" ]; then
-            echo "Normalizing talking head to ${WIDTH}x${HEIGHT}, speed=${TH_SPEED}"
-            ffmpeg -y -i "talking_head.mp4" \
-              -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS},setpts=PTS/${TH_SPEED}" \
-              -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_talking_head.mp4"
-          fi
+          echo "Normalizing video to ${WIDTH}x${HEIGHT} (landscape)"
+          ffmpeg -y -i "source.mp4" \
+            -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
+            -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm.mp4"
 
       - name: Normalize broll clips (9:16 portrait)
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s nullglob
-
-          if [ "$LAYOUT_TYPE" = "talking_head_then_broll" ]; then
-            for f in broll_*.mp4; do
-              n=${f#broll_}; n=${n%.mp4}
-              echo "Normalizing broll clip $n"
-              ffmpeg -y -i "$f" \
-                -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-                -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_broll_${n}.mp4"
-            done
-          else
-            for f in in_*.mp4; do
-              n=${f#in_}; n=${n%.mp4}
-              echo "Normalizing $f"
-              ffmpeg -y -i "$f" \
-                -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-                -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) "norm_${n}.mp4"
-            done
-          fi
+          echo "No broll normalization needed in single video loop mode."
 
       - name: Create talking_head_then_broll sequence
         shell: bash
         run: |
           set -euo pipefail
-          
-          if [ "$LAYOUT_TYPE" != "talking_head_then_broll" ]; then
-            exit 0
+
+          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
+          CLIP_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 norm.mp4 || echo "0")
+          if [ -z "$CLIP_DUR" ] || [ "$CLIP_DUR" = "N/A" ]; then CLIP_DUR="0"; fi
+
+          if awk "BEGIN {exit !($CLIP_DUR > 1.0)}"; then
+            echo "Clip duration: $CLIP_DUR sec"
+          else
+            echo "Error: norm.mp4 duration invalid: $CLIP_DUR"
+            exit 1
           fi
 
-          AUDIO_DUR=$(cat audio_dur.txt)
-          
-          TH_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 "norm_talking_head.mp4" || echo "0")
-          
-          if awk "BEGIN {exit !($TH_DUR > $AUDIO_DUR)}"; then
-            TH_DUR=$AUDIO_DUR
-          fi
-          
-          echo "Talking head: ${TH_DUR}s, Audio: ${AUDIO_DUR}s"
-          
-          ffmpeg -y -i "norm_talking_head.mp4" -t "$TH_DUR" \
-            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-            "seg_talking_head.mp4"
-          
-          REMAIN=$(awk -v a="$AUDIO_DUR" -v t="$TH_DUR" 'BEGIN {r=a-t; if(r<0)r=0; print r}')
-          
-          echo "Remaining time for broll: ${REMAIN}s"
-          
-          if awk "BEGIN {exit !($REMAIN > 0)}"; then
-            CHUNKS=$(awk -v r="$REMAIN" -v c="$CHUNK_SEC" 'BEGIN {print int(r/c + 0.999999)}')
-            if [ "$CHUNKS" -lt 1 ]; then CHUNKS=1; fi
-            
-            echo "Creating $CHUNKS broll chunks"
-            
-            shopt -s nullglob
-            BFILES=(norm_broll_*.mp4)
-            BCOUNT=${#BFILES[@]}
-            
-            if [ "$BCOUNT" -lt 1 ]; then
-              echo "Error: No broll files found"
-              exit 1
-            fi
-            
-            rm -f concat_broll.txt
-            for n in $(seq 1 "$CHUNKS"); do
-              idx=$(( (n - 1) % BCOUNT ))
-              src="${BFILES[$idx]}"
-              
-              ffmpeg -y -i "$src" -t "$CHUNK_SEC" \
-                -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-                "broll_chunk_${n}.mp4"
-              
-              echo "file broll_chunk_${n}.mp4" >> concat_broll.txt
+          XFADE=$(awk -v x="$XFADE_SEC" -v d="$CLIP_DUR" 'BEGIN{
+            max=d*0.25;
+            if (x<=0) x=0.20;
+            if (x>max) x=max;
+            printf("%.3f", x);
+          }')
+
+          N=$(awk -v target="$TARGET_SEC" -v d="$CLIP_DUR" -v x="$XFADE" 'BEGIN{
+            denom=(d-x);
+            if (denom<=0.1) denom=0.1;
+            n=int((target + x)/denom + 0.999999);
+            if (n<2) n=2;
+            print n;
+          }')
+
+          echo "Target: ${TARGET_SEC}s, clip: ${CLIP_DUR}s, xfade: ${XFADE}s, repeats: ${N}"
+
+          INPUTS=()
+          for i in $(seq 1 "$N"); do
+            INPUTS+=(-i norm.mp4)
+          done
+
+          FILTER=""
+          FILTER+="[0:v]setpts=PTS-STARTPTS[v0];"
+          for i in $(seq 1 $((N-1))); do
+            FILTER+="[$i:v]setpts=PTS-STARTPTS[v$i];"
+          done
+
+          OFFSET=$(awk -v d="$CLIP_DUR" -v x="$XFADE" 'BEGIN{printf("%.3f", d-x)}')
+          FILTER+="[v0][v1]xfade=transition=fade:duration=${XFADE}:offset=${OFFSET}[x1];"
+
+          if [ "$N" -gt 2 ]; then
+            for i in $(seq 2 $((N-1))); do
+              OFFSET=$(awk -v d="$CLIP_DUR" -v x="$XFADE" -v k="$((i-1))" 'BEGIN{
+                off = k*d - k*x + (d-x);
+                printf("%.3f", off);
+              }')
+              FILTER+="[x$((i-1))][v$i]xfade=transition=fade:duration=${XFADE}:offset=${OFFSET}[x$i];"
             done
-            
-            ffmpeg -y -f concat -safe 0 -i concat_broll.txt -c copy broll_seq_raw.mp4
-            
-            ffmpeg -y -i broll_seq_raw.mp4 -t "$REMAIN" \
-              -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
-              "seg_broll.mp4"
-            
-            cat > concat_all.txt <<'CONCAT_EOF'
-          file seg_talking_head.mp4
-          file seg_broll.mp4
-          CONCAT_EOF
-            
-            ffmpeg -y -f concat -safe 0 -i concat_all.txt -c copy stack.mp4
-          else
-            cp seg_talking_head.mp4 stack.mp4
           fi
+
+          LAST="x$((N-1))"
+
+          ffmpeg -y "${INPUTS[@]}" \
+            -filter_complex "$FILTER" \
+            -map "[$LAST]" \
+            -t "$TARGET_SEC" \
+            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
+            -movflags +faststart \
+            stack.mp4
 
       - name: Build TikTok style ASS transcription
         shell: bash
         run: |
           set -euo pipefail
-
-          if [ ! -s script.txt ]; then
-            echo "No script.txt, skipping subtitles."
-            touch subs.missing
-            exit 0
-          fi
-
-          TOTAL_SEC=$(cat audio_dur.txt)
-          TEXT=$(sed '/^[[:space:]]*$/d' script.txt | tr '\n' ' ' | sed 's/  */ /g')
-
-          if [ -z "$TEXT" ]; then
-            echo "script.txt has no content, skipping subtitles."
-            touch subs.missing
-            exit 0
-          fi
-
-          mapfile -t WORDS < <(echo "$TEXT" | tr ' ' '\n' | sed '/^[[:space:]]*$/d')
-
-          if [ "${#WORDS[@]}" -eq 0 ]; then
-            echo "No words found, skipping subtitles."
-            touch subs.missing
-            exit 0
-          fi
-
-          total_chars=0
-          declare -a word_chars
-          for i in "${!WORDS[@]}"; do
-            c=${#WORDS[$i]}
-            [ "$c" -lt 1 ] && c=1
-            word_chars[$i]=$c
-            total_chars=$(( total_chars + c ))
-          done
-
-          CAPTION_X=$((WIDTH / 2))
-          CAPTION_Y=$((HEIGHT * 3 / 4))
-
-          cat > subs.ass <<'ASS_HEADER'
-          [Script Info]
-          ScriptType: v4.00+
-          PlayResX: 1080
-          PlayResY: 1920
-          WrapStyle: 2
-          ScaledBorderAndShadow: yes
-
-          [V4+ Styles]
-          Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-          Style: Reels,DejaVu Sans Bold,54,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,6,2,5,60,60,20,1
-
-          [Events]
-          Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-          ASS_HEADER
-
-          sed -i "s/PlayResX: 1080/PlayResX: ${WIDTH}/" subs.ass
-          sed -i "s/PlayResY: 1920/PlayResY: ${HEIGHT}/" subs.ass
-
-          start=0
-          MIN_DURATION=0.28
-          pad=0.06
-          WORDS_PER_CHUNK=3
-
-          i=0
-          while [ $i -lt ${#WORDS[@]} ]; do
-            chunk_end=$((i + WORDS_PER_CHUNK))
-            if [ $chunk_end -gt ${#WORDS[@]} ]; then
-              chunk_end=${#WORDS[@]}
-            fi
-            chunk_size=$((chunk_end - i))
-
-            chunk_chars=0
-            for ((j=i; j<chunk_end; j++)); do
-              chunk_chars=$((chunk_chars + word_chars[j]))
-            done
-
-            chunk_duration=$(awk -v t="$TOTAL_SEC" -v c="$chunk_chars" -v sum="$total_chars" -v min="$MIN_DURATION" -v size="$chunk_size" 'BEGIN{
-              d=t*(c/sum);
-              if (d<(min*size)) d=min*size;
-              print d;
-            }')
-
-            chunk_start_time=$start
-            chunk_end_time=$(awk -v a="$start" -v d="$chunk_duration" 'BEGIN{print a+d}')
-
-            if [ $chunk_end -ge ${#WORDS[@]} ]; then
-              chunk_end_time=$(awk -v t="$TOTAL_SEC" -v p="$pad" 'BEGIN{e=t-p; if(e<0)e=0; print e}')
-              ok=$(awk -v a="$start" -v e="$chunk_end_time" 'BEGIN{print (e>a)?1:0}')
-              [ "$ok" -ne 1 ] && chunk_end_time=$(awk -v a="$start" 'BEGIN{print a+1.0}')
-            fi
-
-            i_word_start=$start
-
-            for ((j=i; j<chunk_end; j++)); do
-              word_len=${word_chars[j]}
-
-              word_duration=$(awk -v total="$chunk_duration" -v c="$word_len" -v sum="$chunk_chars" -v min="$MIN_DURATION" 'BEGIN{
-                d=total*(c/sum);
-                if (d<min) d=min;
-                print d;
-              }')
-
-              word_end=$(awk -v a="$i_word_start" -v d="$word_duration" 'BEGIN{print a+d}')
-              if [ $j -eq $((chunk_end - 1)) ]; then
-                word_end=$chunk_end_time
-              fi
-
-              s_str=$(awk -v t="$i_word_start" 'BEGIN{
-                if (t<0) t=0;
-                h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
-                cs=int((s - int(s))*100);
-                printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
-              }')
-
-              e_str=$(awk -v t="$word_end" 'BEGIN{
-                if (t<0) t=0;
-                h=int(t/3600); m=int((t-h*3600)/60); s=t-h*3600-m*60;
-                cs=int((s - int(s))*100);
-                printf("%d:%02d:%02d.%02d", h, m, int(s), cs);
-              }')
-
-              text=""
-              for ((k=i; k<chunk_end; k++)); do
-                word="${WORDS[k]}"
-
-                esc="$(printf '%s' "$word" | sed -e 's/\\/\\\\/g' -e 's/{/\\{/g' -e 's/}/\\}/g')"
-
-                if [ $k -eq $j ]; then
-                  text="${text}{\\c&H00FFFF&}${esc}{\\c&HFFFFFF&}"
-                else
-                  text="${text}${esc}"
-                fi
-
-                if [ $k -lt $((chunk_end - 1)) ]; then
-                  text="${text} "
-                fi
-              done
-
-              # CHANGE: remove per-word fade to stop "blinking"
-              # Keep rest of formatting the same (position, blur, colors).
-              printf 'Dialogue: 0,%s,%s,Reels,,0,0,0,,{\\an5\\pos(%d,%d)\\blur0.4}%s\n' \
-                "$s_str" "$e_str" "$CAPTION_X" "$CAPTION_Y" "$text" >> subs.ass
-
-              i_word_start=$word_end
-            done
-
-            i=$chunk_end
-            start=$chunk_end_time
-          done
+          echo "Skipping subtitles for ambient landscape video."
+          touch subs.missing
 
       - name: Burn subtitles and mux audio
         shell: bash
         run: |
           set -euo pipefail
 
-          FILTER_ARGS=()
-          if [ -s subs.ass ]; then
-            FILTER_ARGS=(-vf "subtitles=subs.ass")
-          fi
-
-          ffmpeg -y -stream_loop -1 -i stack.mp4 -i audio.m4a \
-            "${FILTER_ARGS[@]}" \
+          ffmpeg -y -i stack.mp4 -i audio.m4a \
             -map 0:v:0 -map 1:a:0 \
             -shortest \
             -c:v libx264 -profile:v high -pix_fmt yuv420p -r "$FPS" \
-            -c:a copy \
+            -c:a aac -b:a 192k \
             -movflags +faststart "$OUT_NAME"
 
       - name: Upload artifact
