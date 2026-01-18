@@ -12,6 +12,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
+    env:
+      # Hard cap for the final MP4
+      # 1,000,000,000 bytes = 1.0 GB (decimal). If you want 1 GiB, use 1073741824.
+      MAX_OUTPUT_BYTES: 1000000000
+
+      # Audio bitrate cap (keep it modest, video gets the rest)
+      AUDIO_BITRATE_K: 128
+
+      # Safety margin to account for container overhead and bitrate rounding
+      SIZE_SAFETY: "0.92"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,13 +61,13 @@ jobs:
             exit 1
           fi
 
-          echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
-          echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
-          echo "WIDTH=$WIDTH" >> $GITHUB_ENV
-          echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
-          echo "FPS=$FPS" >> $GITHUB_ENV
-          echo "TARGET_MINUTES=$TARGET_MINUTES" >> $GITHUB_ENV
-          echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
+          echo "VIDEO_URL=$VIDEO_URL" >> "$GITHUB_ENV"
+          echo "OUT_NAME=$OUT_NAME" >> "$GITHUB_ENV"
+          echo "WIDTH=$WIDTH" >> "$GITHUB_ENV"
+          echo "HEIGHT=$HEIGHT" >> "$GITHUB_ENV"
+          echo "FPS=$FPS" >> "$GITHUB_ENV"
+          echo "TARGET_MINUTES=$TARGET_MINUTES" >> "$GITHUB_ENV"
+          echo "XFADE_SEC=$XFADE_SEC" >> "$GITHUB_ENV"
 
       - name: Download video
         shell: bash
@@ -65,20 +76,56 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$VIDEO_URL" -o source.mp4
 
-      - name: Normalize video
+      - name: Normalize video (short source, no audio)
         shell: bash
         run: |
           set -euo pipefail
           ffmpeg -y -i source.mp4 \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-            -an -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -g $((FPS*2)) norm.mp4
+            -an -c:v libx264 -preset veryfast -crf 22 -pix_fmt yuv420p -g $((FPS*2)) norm.mp4
 
-      - name: Create looped video
+      - name: Compute target bitrates for max file size
         shell: bash
         run: |
           set -euo pipefail
 
-          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
+          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{printf("%.0f", m*60)}')
+          MAX_BYTES="${MAX_OUTPUT_BYTES}"
+          SAFETY="${SIZE_SAFETY}"
+          AUDIO_K="${AUDIO_BITRATE_K}"
+
+          # total_kbps = (max_bytes * 8 bits/byte) / seconds / 1000 * safety
+          TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
+            kbps = (b*8)/(s*1000)*f;
+            if (kbps < 300) kbps = 300;
+            printf("%.0f", kbps);
+          }')
+
+          VIDEO_K=$(( TOTAL_K - AUDIO_K ))
+          if [ "$VIDEO_K" -lt 300 ]; then
+            VIDEO_K=300
+          fi
+
+          echo "TARGET_SEC=$TARGET_SEC" >> "$GITHUB_ENV"
+          echo "TOTAL_BITRATE_K=$TOTAL_K" >> "$GITHUB_ENV"
+          echo "VIDEO_BITRATE_K=$VIDEO_K" >> "$GITHUB_ENV"
+          echo "AUDIO_BITRATE_K=$AUDIO_K" >> "$GITHUB_ENV"
+
+          echo "Target duration: ${TARGET_SEC}s"
+          echo "Max bytes: ${MAX_BYTES}"
+          echo "Total target bitrate: ${TOTAL_K} kbps"
+          echo "Video bitrate: ${VIDEO_K} kbps"
+          echo "Audio bitrate: ${AUDIO_K} kbps"
+
+      - name: Create looped video (size-capped)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TARGET_SEC="${TARGET_SEC}"
+          VIDEO_K="${VIDEO_BITRATE_K}"
+          FPS="${FPS}"
+
           CLIP_DUR=$(ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 norm.mp4)
 
           XFADE=$(awk -v x="$XFADE_SEC" -v d="$CLIP_DUR" 'BEGIN{
@@ -117,11 +164,14 @@ jobs:
 
           LAST="x$((N-1))"
 
+          # Encode video at a controlled bitrate so the 30-min file stays small
           ffmpeg -y "${INPUTS[@]}" \
             -filter_complex "$FILTER" \
             -map "[$LAST]" \
             -t "$TARGET_SEC" \
-            -c:v libx264 -preset veryfast -crf 18 -pix_fmt yuv420p -r "$FPS" \
+            -c:v libx264 -preset veryfast \
+            -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
+            -pix_fmt yuv420p -r "$FPS" -g $((FPS*2)) \
             -movflags +faststart loop_video.mp4
 
       - name: Download and build looped audio from audio_urls
@@ -129,14 +179,15 @@ jobs:
         run: |
           set -euo pipefail
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
-          TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{print m*60}')
+          TARGET_SEC="${TARGET_SEC}"
+          AUDIO_K="${AUDIO_BITRATE_K}"
 
           jq -r 'try .audio_urls // [] | .[]' payload.json > audio_urls.txt || true
 
           if [ ! -s audio_urls.txt ]; then
             echo "No audio_urls provided, generating silence"
             ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
-              -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+              -t "$TARGET_SEC" -c:a aac -b:a "${AUDIO_K}k" audio.m4a
             exit 0
           fi
 
@@ -176,12 +227,12 @@ jobs:
           if [ "$COUNT" -lt 1 ]; then
             echo "No valid audio downloaded, generating silence"
             ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
-              -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+              -t "$TARGET_SEC" -c:a aac -b:a "${AUDIO_K}k" audio.m4a
             exit 0
           fi
 
           if [ "$COUNT" -eq 1 ]; then
-            ffmpeg -y -stream_loop -1 -i a1.wav -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+            ffmpeg -y -stream_loop -1 -i a1.wav -t "$TARGET_SEC" -c:a aac -b:a "${AUDIO_K}k" audio.m4a
             exit 0
           fi
 
@@ -204,7 +255,7 @@ jobs:
           fi
 
           ffmpeg -y "${INPUTS[@]}" -filter_complex "$FILTER" -map "[$LAST]" playlist.wav
-          ffmpeg -y -stream_loop -1 -i playlist.wav -t "$TARGET_SEC" -c:a aac -b:a 192k audio.m4a
+          ffmpeg -y -stream_loop -1 -i playlist.wav -t "$TARGET_SEC" -c:a aac -b:a "${AUDIO_K}k" audio.m4a
 
       - name: Mux video + audio
         shell: bash
@@ -212,8 +263,60 @@ jobs:
           set -euo pipefail
           ffmpeg -y -i loop_video.mp4 -i audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
-            -c:v copy -c:a aac -b:a 192k \
+            -c:v copy -c:a aac -b:a "${AUDIO_BITRATE_K}k" \
             -movflags +faststart "${OUT_NAME}"
+
+      - name: Enforce max size (re-encode if still too big)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          MAX_BYTES="${MAX_OUTPUT_BYTES}"
+          OUT="${OUT_NAME}"
+
+          ACTUAL_BYTES=$(stat -c%s "$OUT")
+          echo "Output size bytes: $ACTUAL_BYTES (max $MAX_BYTES)"
+
+          if [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]; then
+            echo "OK: under max size"
+            exit 0
+          fi
+
+          echo "Too large, re-encoding to fit under max size"
+
+          TARGET_SEC="${TARGET_SEC}"
+          AUDIO_K="${AUDIO_BITRATE_K}"
+          SAFETY="${SIZE_SAFETY}"
+
+          # Compute a stricter bitrate based on actual overshoot
+          TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
+            kbps = (b*8)/(s*1000)*f;
+            if (kbps < 300) kbps = 300;
+            printf("%.0f", kbps);
+          }')
+
+          VIDEO_K=$(( TOTAL_K - AUDIO_K ))
+          if [ "$VIDEO_K" -lt 250 ]; then
+            VIDEO_K=250
+          fi
+
+          echo "Re-encode total ${TOTAL_K} kbps, video ${VIDEO_K} kbps, audio ${AUDIO_K} kbps"
+
+          ffmpeg -y -i loop_video.mp4 -i audio.m4a \
+            -map 0:v:0 -map 1:a:0 -shortest \
+            -c:v libx264 -preset veryfast \
+            -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
+            -c:a aac -b:a "${AUDIO_K}k" \
+            -movflags +faststart "${OUT}.tmp.mp4"
+
+          mv "${OUT}.tmp.mp4" "${OUT}"
+
+          ACTUAL_BYTES=$(stat -c%s "$OUT")
+          echo "New output size bytes: $ACTUAL_BYTES (max $MAX_BYTES)"
+          if [ "$ACTUAL_BYTES" -gt "$MAX_BYTES" ]; then
+            echo "Still too large. Consider lowering resolution (e.g., 1280x720) or reducing target_minutes."
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
