@@ -13,6 +13,7 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -25,7 +26,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ffmpeg curl
 
-      - name: Prepare payload and bitrate budget
+      - name: Prepare payload and bitrate budget (force 720p, max 80MB)
         shell: bash
         run: |
           set -euo pipefail
@@ -45,8 +46,6 @@ jobs:
           fi
 
           OUT_NAME="$(jq -r '.out_name // "output.mp4"' payload.json)"
-          WIDTH="$(jq -r '.width // 1920' payload.json)"
-          HEIGHT="$(jq -r '.height // 1080' payload.json)"
           FPS="$(jq -r '.fps // 30' payload.json)"
           TARGET_MINUTES="$(jq -r '.target_minutes // 20' payload.json)"
           XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
@@ -54,49 +53,32 @@ jobs:
           if [ -z "$TARGET_MINUTES" ] || [ "$TARGET_MINUTES" = "null" ] || [ "$TARGET_MINUTES" -lt 1 ]; then TARGET_MINUTES=20; fi
           TARGET_SEC=$((TARGET_MINUTES*60))
 
-          # 50MB max
-          MAX_OUTPUT_BYTES=$((50*1024*1024))
+          # Max size 80MB (hard cap)
+          MAX_OUTPUT_BYTES=$((80*1024*1024))
 
-          # Audio settings
+          # Force output to 720p (clarity requirement)
+          OUT_W=1280
+          OUT_H=720
+
+          # Audio settings (keep your current sound)
           FINAL_AUDIO_BITRATE_K=128
           MUSIC_GAIN=0.9
           BG_GAIN=0.35
 
           # Total kbps budget for MAX_OUTPUT_BYTES over TARGET_SEC (mp4 overhead safety)
-          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.95)}')"
-          if [ "$TOTAL_K_BUDGET" -lt 180 ]; then TOTAL_K_BUDGET=180; fi
+          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.96)}')"
+          if [ "$TOTAL_K_BUDGET" -lt 300 ]; then TOTAL_K_BUDGET=300; fi
 
           VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
-          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then
+          if [ "$VIDEO_K_BUDGET" -lt 500 ]; then
+            # Keep 720p watchable: if budget is too low, reduce audio a bit but do NOT drop resolution
             FINAL_AUDIO_BITRATE_K=96
             VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
           fi
-          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then VIDEO_K_BUDGET=60; fi
-
-          # Quality without increasing size:
-          # You cannot increase true quality at the same bitrate, but you can improve perceived quality by:
-          # 1) Using 2-pass encoding so bits go where they matter
-          # 2) Using a slower preset (better compression efficiency)
-          # 3) Using an output resolution that matches the bitrate budget
-          #
-          # This workflow keeps the exact same bitrate budget and uses 2-pass + medium preset.
-
-          OUT_W="$WIDTH"
-          OUT_H="$HEIGHT"
-
-          # Resolution ladder to avoid blocky look at low kbps
-          if [ "$VIDEO_K_BUDGET" -lt 350 ]; then
-            OUT_W=854
-            OUT_H=480
-          elif [ "$VIDEO_K_BUDGET" -lt 650 ]; then
-            OUT_W=1280
-            OUT_H=720
-          fi
+          if [ "$VIDEO_K_BUDGET" -lt 500 ]; then VIDEO_K_BUDGET=500; fi
 
           echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
-          echo "WIDTH=$WIDTH" >> $GITHUB_ENV
-          echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "TARGET_SEC=$TARGET_SEC" >> $GITHUB_ENV
           echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
@@ -117,7 +99,7 @@ jobs:
           echo "Total kbps budget: ${TOTAL_K_BUDGET}k"
           echo "Audio kbps: ${FINAL_AUDIO_BITRATE_K}k"
           echo "Video kbps budget: ${VIDEO_K_BUDGET}k"
-          echo "Chosen output res: ${OUT_W}x${OUT_H}"
+          echo "Forced output res: ${OUT_W}x${OUT_H}"
 
       - name: Download source video
         shell: bash
@@ -136,7 +118,7 @@ jobs:
             echo "No source audio stream"
           fi
 
-      - name: Build looped video (2-pass, same size budget)
+      - name: Build looped video (720p forced, 2-pass, within 80MB budget)
         shell: bash
         run: |
           set -euo pipefail
@@ -147,12 +129,9 @@ jobs:
           TARGET_SEC="${TARGET_SEC}"
           VIDEO_K="${VIDEO_K_BUDGET}"
 
-          # Common filter
           VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},fps=${FPS},setsar=1"
 
-          # 2-pass encoding improves quality at the same bitrate by allocating bits better.
-          # Preset "medium" improves compression efficiency vs "veryfast" without being too slow.
-          # VBV keeps bitrate within budget.
+          # 2-pass improves perceived quality at the same bitrate
           X264OPTS="-preset medium -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0"
 
           # Pass 1
@@ -287,7 +266,7 @@ jobs:
             -c:v copy -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT_NAME}"
 
-      - name: Enforce max size 50MB (safety net)
+      - name: Enforce max size 80MB (safety net, keep 720p)
         shell: bash
         run: |
           set -euo pipefail
@@ -295,7 +274,6 @@ jobs:
           MAX_BYTES="${MAX_OUTPUT_BYTES}"
           OUT="${OUT_NAME}"
           TARGET_SEC="${TARGET_SEC}"
-          AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
 
           bytes() { stat -c%s "$1"; }
 
@@ -307,45 +285,37 @@ jobs:
             exit 0
           fi
 
-          echo "Too large. Retrying with tighter bitrates and downscale ladder."
+          echo "Too large. Retrying with tighter bitrates (still 720p)."
 
+          # Compute total kbps budget from max bytes and duration, includes overhead safety factor
           total_k_from_bytes () {
             awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$1" 'BEGIN{
               kbps = (b*8)/(s*1000)*f;
-              if (kbps < 180) kbps = 180;
+              if (kbps < 300) kbps = 300;
               printf("%.0f", kbps);
             }'
           }
 
-          audio_floor () {
-            if [ "$1" -lt 64 ]; then echo 64; else echo "$1"; fi
+          # Keep audio reasonable, but allow a small drop if needed to save size
+          pick_audio_k () {
+            local k="$1"
+            if [ "$k" -ge 128 ]; then echo 128; elif [ "$k" -ge 96 ]; then echo 96; else echo 80; fi
           }
 
-          try_encode () {
-            local VF="$1"
-            local TOTAL_K="$2"
-            local AUDIOK="$3"
+          try_encode_720p () {
+            local TOTAL_K="$1"
+            local AUDIOK="$2"
             local VIDEOK=$(( TOTAL_K - AUDIOK ))
-            if [ "$VIDEOK" -lt 60 ]; then VIDEOK=60; fi
+            if [ "$VIDEOK" -lt 450 ]; then VIDEOK=450; fi
 
-            echo "Encode: vf=${VF:-none}, total=${TOTAL_K}k, video=${VIDEOK}k, audio=${AUDIOK}k"
+            echo "Re-encode 720p: total=${TOTAL_K}k, video=${VIDEOK}k, audio=${AUDIOK}k"
 
-            if [ -z "$VF" ]; then
-              ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
-                -map 0:v:0 -map 1:a:0 -shortest \
-                -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p \
-                -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
-                -c:a aac -b:a "${AUDIOK}k" \
-                -movflags +faststart "${OUT}.tmp.mp4"
-            else
-              ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
-                -map 0:v:0 -map 1:a:0 -shortest \
-                -vf "$VF" \
-                -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p \
-                -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
-                -c:a aac -b:a "${AUDIOK}k" \
-                -movflags +faststart "${OUT}.tmp.mp4"
-            fi
+            ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
+              -map 0:v:0 -map 1:a:0 -shortest \
+              -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p \
+              -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
+              -c:a aac -b:a "${AUDIOK}k" \
+              -movflags +faststart "${OUT}.tmp.mp4"
 
             mv "${OUT}.tmp.mp4" "${OUT}"
             ACTUAL_BYTES=$(bytes "$OUT")
@@ -353,34 +323,31 @@ jobs:
             [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]
           }
 
-          TOTAL_K=$(total_k_from_bytes 0.93)
-          if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
+          # Retry 1: tighter total, keep audio 128
+          TOTAL_K=$(total_k_from_bytes 0.95)
+          AUDIO_K=$(pick_audio_k 128)
+          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry1"
             exit 0
           fi
 
-          AUDIO_K=$(audio_floor 96)
-          TOTAL_K=$(total_k_from_bytes 0.95)
-          if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
+          # Retry 2: tighter total, drop audio to 96
+          TOTAL_K=$(total_k_from_bytes 0.96)
+          AUDIO_K=$(pick_audio_k 96)
+          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry2"
             exit 0
           fi
 
-          AUDIO_K=$(audio_floor 96)
+          # Retry 3: even tighter total, drop audio to 80
           TOTAL_K=$(total_k_from_bytes 0.97)
-          if try_encode "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
+          AUDIO_K=$(pick_audio_k 80)
+          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry3"
             exit 0
           fi
 
-          AUDIO_K=$(audio_floor 64)
-          TOTAL_K=$(total_k_from_bytes 0.99)
-          if try_encode "scale=854:480:force_original_aspect_ratio=increase,crop=854:480,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
-            echo "OK after retry4"
-            exit 0
-          fi
-
-          echo "Still above 50MB. Consider lowering target_minutes or accepting smaller resolution."
+          echo "Still above 80MB at 720p. Reduce target_minutes or increase max MB."
           exit 1
 
       - name: Upload artifact
