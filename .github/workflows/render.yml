@@ -1,4 +1,55 @@
-1024))
+name: Render Reel
+
+on:
+  repository_dispatch:
+    types: [render_reel]
+  workflow_dispatch:
+    inputs:
+      payload_json:
+        description: "Optional JSON payload override"
+        required: false
+        default: ""
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq ffmpeg curl
+      - name: Prepare payload and bitrate budget
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Payload source: repo_dispatch.client_payload OR workflow_dispatch input
+          if [ -n "${{ github.event.inputs.payload_json || '' }}" ]; then
+            echo '${{ github.event.inputs.payload_json }}' > payload.json
+          else
+            echo '${{ toJson(github.event.client_payload) }}' > payload.json
+          fi
+          VIDEO_URL="$(jq -r '.layout_config.video_url // empty' payload.json)"
+          if [ -z "$VIDEO_URL" ] || [ "$VIDEO_URL" = "null" ]; then
+            echo "Missing payload.layout_config.video_url"
+            cat payload.json
+            exit 1
+          fi
+          OUT_NAME="$(jq -r '.out_name // "output.mp4"' payload.json)"
+          WIDTH="$(jq -r '.width // 1920' payload.json)"
+          HEIGHT="$(jq -r '.height // 1080' payload.json)"
+          FPS="$(jq -r '.fps // 30' payload.json)"
+          TARGET_MINUTES="$(jq -r '.target_minutes // 20' payload.json)"
+          XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
+          if [ -z "$TARGET_MINUTES" ] || [ "$TARGET_MINUTES" = "null" ] || [ "$TARGET_MINUTES" -lt 1 ]; then TARGET_MINUTES=20; fi
+          TARGET_SEC=$((TARGET_MINUTES*60))
+          # 80MB max (increased from 50MB)
+          MAX_OUTPUT_BYTES=$((80*1024*1024))
           # Audio settings (improved quality)
           FINAL_AUDIO_BITRATE_K=160
           MUSIC_GAIN=0.9
