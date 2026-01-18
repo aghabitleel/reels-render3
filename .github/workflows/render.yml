@@ -26,12 +26,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq ffmpeg curl
 
-      - name: Prepare payload and bitrate budget (force 720p, max 80MB)
+      - name: Prepare payload and bitrate budget (force 720p, max 80MB, higher perceived HD)
         shell: bash
         run: |
           set -euo pipefail
 
-          # Payload source: repo_dispatch.client_payload OR workflow_dispatch input
           if [ -n "${{ github.event.inputs.payload_json || '' }}" ]; then
             echo '${{ github.event.inputs.payload_json }}' > payload.json
           else
@@ -48,40 +47,38 @@ jobs:
           OUT_NAME="$(jq -r '.out_name // "output.mp4"' payload.json)"
           FPS="$(jq -r '.fps // 30' payload.json)"
           TARGET_MINUTES="$(jq -r '.target_minutes // 20' payload.json)"
-          XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
 
           if [ -z "$TARGET_MINUTES" ] || [ "$TARGET_MINUTES" = "null" ] || [ "$TARGET_MINUTES" -lt 1 ]; then TARGET_MINUTES=20; fi
           TARGET_SEC=$((TARGET_MINUTES*60))
 
-          # Max size 80MB (hard cap)
+          # Max size 80MB
           MAX_OUTPUT_BYTES=$((80*1024*1024))
 
-          # Force output to 720p (clarity requirement)
+          # Force output to 720p
           OUT_W=1280
           OUT_H=720
 
-          # Audio settings (keep your current sound)
+          # Audio settings
           FINAL_AUDIO_BITRATE_K=128
           MUSIC_GAIN=0.9
           BG_GAIN=0.35
 
           # Total kbps budget for MAX_OUTPUT_BYTES over TARGET_SEC (mp4 overhead safety)
-          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.96)}')"
-          if [ "$TOTAL_K_BUDGET" -lt 300 ]; then TOTAL_K_BUDGET=300; fi
+          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.965)}')"
+          if [ "$TOTAL_K_BUDGET" -lt 320 ]; then TOTAL_K_BUDGET=320; fi
 
           VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
-          if [ "$VIDEO_K_BUDGET" -lt 500 ]; then
-            # Keep 720p watchable: if budget is too low, reduce audio a bit but do NOT drop resolution
+          if [ "$VIDEO_K_BUDGET" -lt 650 ]; then
+            # Improve perceived HD by giving video more bits before touching resolution
             FINAL_AUDIO_BITRATE_K=96
             VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
           fi
-          if [ "$VIDEO_K_BUDGET" -lt 500 ]; then VIDEO_K_BUDGET=500; fi
+          if [ "$VIDEO_K_BUDGET" -lt 650 ]; then VIDEO_K_BUDGET=650; fi
 
           echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "TARGET_SEC=$TARGET_SEC" >> $GITHUB_ENV
-          echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
           echo "MAX_OUTPUT_BYTES=$MAX_OUTPUT_BYTES" >> $GITHUB_ENV
           echo "FINAL_AUDIO_BITRATE_K=$FINAL_AUDIO_BITRATE_K" >> $GITHUB_ENV
           echo "MUSIC_GAIN=$MUSIC_GAIN" >> $GITHUB_ENV
@@ -118,7 +115,7 @@ jobs:
             echo "No source audio stream"
           fi
 
-      - name: Build looped video (720p forced, 2-pass, within 80MB budget)
+      - name: Build looped video (720p, 2-pass, better HD look)
         shell: bash
         run: |
           set -euo pipefail
@@ -129,10 +126,12 @@ jobs:
           TARGET_SEC="${TARGET_SEC}"
           VIDEO_K="${VIDEO_K_BUDGET}"
 
-          VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},fps=${FPS},setsar=1"
+          # Mild denoise + unsharp improves perceived "HD" at the same resolution/bitrate.
+          # These are intentionally light to avoid artifacts.
+          VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},fps=${FPS},setsar=1,hqdn3d=1.0:1.0:2.0:2.0,unsharp=5:5:0.6:3:3:0.0"
 
-          # 2-pass improves perceived quality at the same bitrate
-          X264OPTS="-preset medium -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0"
+          # Better compression efficiency than medium, still usually OK within 45m for 20min video
+          X264OPTS="-preset slow -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0"
 
           # Pass 1
           ffmpeg -y -stream_loop -1 -i source.mp4 \
@@ -238,7 +237,7 @@ jobs:
           CLARITY_FILTER="highpass=f=35,acompressor=threshold=-18dB:ratio=2:attack=15:release=200:makeup=4,equalizer=f=3500:t=q:w=1.0:g=2,loudnorm=I=-16:TP=-1.5:LRA=9"
 
           if [ -f src_audio.m4a ]; then
-            echo "Mixing source ambience + music. BG_GAIN=${BG_GAIN}, MUSIC_GAIN=${MUSIC_GAIN}"
+            echo "Mixing source ambience + music"
             ffmpeg -y \
               -i music.wav \
               -i src_audio.m4a \
@@ -287,32 +286,25 @@ jobs:
 
           echo "Too large. Retrying with tighter bitrates (still 720p)."
 
-          # Compute total kbps budget from max bytes and duration, includes overhead safety factor
           total_k_from_bytes () {
             awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$1" 'BEGIN{
               kbps = (b*8)/(s*1000)*f;
-              if (kbps < 300) kbps = 300;
+              if (kbps < 320) kbps = 320;
               printf("%.0f", kbps);
             }'
-          }
-
-          # Keep audio reasonable, but allow a small drop if needed to save size
-          pick_audio_k () {
-            local k="$1"
-            if [ "$k" -ge 128 ]; then echo 128; elif [ "$k" -ge 96 ]; then echo 96; else echo 80; fi
           }
 
           try_encode_720p () {
             local TOTAL_K="$1"
             local AUDIOK="$2"
             local VIDEOK=$(( TOTAL_K - AUDIOK ))
-            if [ "$VIDEOK" -lt 450 ]; then VIDEOK=450; fi
+            if [ "$VIDEOK" -lt 550 ]; then VIDEOK=550; fi
 
             echo "Re-encode 720p: total=${TOTAL_K}k, video=${VIDEOK}k, audio=${AUDIOK}k"
 
             ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
               -map 0:v:0 -map 1:a:0 -shortest \
-              -c:v libx264 -preset medium -profile:v high -pix_fmt yuv420p \
+              -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
               -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
               -c:a aac -b:a "${AUDIOK}k" \
               -movflags +faststart "${OUT}.tmp.mp4"
@@ -323,26 +315,20 @@ jobs:
             [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]
           }
 
-          # Retry 1: tighter total, keep audio 128
-          TOTAL_K=$(total_k_from_bytes 0.95)
-          AUDIO_K=$(pick_audio_k 128)
-          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
+          TOTAL_K=$(total_k_from_bytes 0.955)
+          if try_encode_720p "$TOTAL_K" 128; then
             echo "OK after retry1"
             exit 0
           fi
 
-          # Retry 2: tighter total, drop audio to 96
-          TOTAL_K=$(total_k_from_bytes 0.96)
-          AUDIO_K=$(pick_audio_k 96)
-          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
+          TOTAL_K=$(total_k_from_bytes 0.965)
+          if try_encode_720p "$TOTAL_K" 96; then
             echo "OK after retry2"
             exit 0
           fi
 
-          # Retry 3: even tighter total, drop audio to 80
-          TOTAL_K=$(total_k_from_bytes 0.97)
-          AUDIO_K=$(pick_audio_k 80)
-          if try_encode_720p "$TOTAL_K" "$AUDIO_K"; then
+          TOTAL_K=$(total_k_from_bytes 0.975)
+          if try_encode_720p "$TOTAL_K" 80; then
             echo "OK after retry3"
             exit 0
           fi
