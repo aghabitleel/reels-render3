@@ -14,10 +14,9 @@ jobs:
 
     env:
       # HARD CAP: final mp4 must be under 100 MB
-      # 100,000,000 bytes = 100 MB (decimal). If you want MiB, use 104857600.
       MAX_OUTPUT_BYTES: 100000000
 
-      # Keep the same bitrate so size does not increase
+      # Final mixed audio bitrate (AAC)
       FINAL_AUDIO_BITRATE_K: 64
 
       # Source (Pexels) background audio extraction bitrate (AAC)
@@ -36,14 +35,15 @@ jobs:
       # Xfade between loop segments (seconds)
       DEFAULT_XFADE_SEC: "0.35"
 
-      # Audio quality upgrades that do NOT increase bitrate
-      # Better encoder settings at the same bitrate
-      AAC_PROFILE: "aac_low"
-      AAC_CUTOFF_HZ: "18000"
+      # Audio perceived-quality helpers (no file size increase)
       LOUDNORM_I: "-16"
       LOUDNORM_TP: "-1.5"
       LOUDNORM_LRA: "11"
       DITHER: "triangular"
+
+      # AAC encode hints (keeps size same, can help quality)
+      AAC_PROFILE: "aac_low"
+      AAC_CUTOFF_HZ: "16000"
 
     steps:
       - name: Checkout
@@ -106,10 +106,12 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Normalize video to consistent resolution/fps, keep audio out for now
           ffmpeg -y -i source.mp4 \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
             -an -c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p -g $((FPS*2)) norm_video.mp4
 
+          # Try extract source audio (may fail if no audio). Never fail the job.
           if ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 source.mp4 >/dev/null 2>&1; then
             ffmpeg -y -i source.mp4 -vn -ac 2 -ar 48000 -c:a aac -b:a "${SRC_AUDIO_EXTRACT_BITRATE_K}k" src_audio.m4a || true
           else
@@ -126,6 +128,7 @@ jobs:
           SAFETY="${SIZE_SAFETY}"
           AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
 
+          # total_kbps = (max_bytes * 8) / seconds / 1000 * safety
           TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
             kbps = (b*8)/(s*1000)*f;
             if (kbps < 120) kbps = 120;
@@ -295,11 +298,18 @@ jobs:
           BG_GAIN="${BG_GAIN}"
           MUSIC_GAIN="${MUSIC_GAIN}"
 
-          # Improvements without increasing file size:
-          # 1) High-pass to remove rumble, low-pass to reduce harsh high end before AAC
-          # 2) Gentle compression to stabilize perceived loudness
-          # 3) Loudnorm for consistent output (still same bitrate)
-          # 4) Encode AAC with explicit profile and cutoff
+          LOUDNORM_I="${LOUDNORM_I}"
+          LOUDNORM_TP="${LOUDNORM_TP}"
+          LOUDNORM_LRA="${LOUDNORM_LRA}"
+          DITHER="${DITHER}"
+
+          AAC_PROFILE="${AAC_PROFILE}"
+          AAC_CUTOFF_HZ="${AAC_CUTOFF_HZ}"
+
+          # Notes:
+          # - Filters improve perceived clarity without changing bitrate.
+          # - Dither applies before AAC encode to reduce low-level artifacts.
+          # - Output is already AAC, so later mux should COPY audio.
 
           if [ -f src_audio.m4a ]; then
             echo "Source audio found, mixing with music. BG_GAIN=${BG_GAIN}, MUSIC_GAIN=${MUSIC_GAIN}"
@@ -311,7 +321,8 @@ jobs:
                 [1:a]volume=${BG_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,highpass=f=45,lowpass=f=14000,aloop=loop=-1:size=2000000000[bg]; \
                 [m][bg]amix=inputs=2:duration=first:dropout_transition=2, \
                 acompressor=threshold=-18dB:ratio=2:attack=10:release=120:makeup=2, \
-                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA} \
+                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA}, \
+                aresample=48000:dither_method=${DITHER} \
                 [out]" \
               -map "[out]" -t "$TARGET_SEC" \
               -c:a aac -profile:a "${AAC_PROFILE}" -cutoff "${AAC_CUTOFF_HZ}" \
@@ -324,7 +335,8 @@ jobs:
               -filter_complex "\
                 [0:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,highpass=f=35,lowpass=f=${AAC_CUTOFF_HZ}, \
                 acompressor=threshold=-18dB:ratio=2:attack=10:release=120:makeup=2, \
-                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA} \
+                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA}, \
+                aresample=48000:dither_method=${DITHER} \
                 [out]" \
               -map "[out]" -t "$TARGET_SEC" \
               -c:a aac -profile:a "${AAC_PROFILE}" -cutoff "${AAC_CUTOFF_HZ}" \
@@ -338,7 +350,8 @@ jobs:
           set -euo pipefail
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
-            -c:v copy -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" \
+            -c:v copy -c:a copy \
+            -map_metadata -1 \
             -movflags +faststart "${OUT_NAME}"
 
       - name: Enforce max size 100MB (adaptive, may reduce resolution)
@@ -371,6 +384,7 @@ jobs:
             }'
           }
 
+          # Retry 1: lower bitrate same resolution
           TOTAL_K=$(calc_total_k 0.78)
           VIDEO_K=$(( TOTAL_K - AUDIO_K ))
           if [ "$VIDEO_K" -lt 45 ]; then VIDEO_K=45; fi
@@ -381,7 +395,8 @@ jobs:
             -map 0:v:0 -map 1:a:0 -shortest \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a aac -b:a "${AUDIO_K}k" \
+            -c:a copy \
+            -map_metadata -1 \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
@@ -393,6 +408,7 @@ jobs:
             exit 0
           fi
 
+          # Retry 2: downscale to 1280x720
           TOTAL_K=$(calc_total_k 0.82)
           VIDEO_K=$(( TOTAL_K - AUDIO_K ))
           if [ "$VIDEO_K" -lt 40 ]; then VIDEO_K=40; fi
@@ -404,7 +420,8 @@ jobs:
             -vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1" \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a aac -b:a "${AUDIO_K}k" \
+            -c:a copy \
+            -map_metadata -1 \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
@@ -416,6 +433,7 @@ jobs:
             exit 0
           fi
 
+          # Retry 3: downscale to 854x480 (16:9)
           TOTAL_K=$(calc_total_k 0.86)
           VIDEO_K=$(( TOTAL_K - AUDIO_K ))
           if [ "$VIDEO_K" -lt 35 ]; then VIDEO_K=35; fi
@@ -427,7 +445,8 @@ jobs:
             -vf "scale=854:480:force_original_aspect_ratio=increase,crop=854:480,setsar=1" \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a aac -b:a "${AUDIO_K}k" \
+            -c:a copy \
+            -map_metadata -1 \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
