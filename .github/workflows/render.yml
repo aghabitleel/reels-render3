@@ -13,7 +13,6 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -25,60 +24,63 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y jq ffmpeg curl
-
-      - name: Prepare payload and bitrate budget (force 720p, max 80MB, higher perceived HD)
+      - name: Prepare payload and bitrate budget
         shell: bash
         run: |
           set -euo pipefail
-
+          # Payload source: repo_dispatch.client_payload OR workflow_dispatch input
           if [ -n "${{ github.event.inputs.payload_json || '' }}" ]; then
             echo '${{ github.event.inputs.payload_json }}' > payload.json
           else
             echo '${{ toJson(github.event.client_payload) }}' > payload.json
           fi
-
           VIDEO_URL="$(jq -r '.layout_config.video_url // empty' payload.json)"
           if [ -z "$VIDEO_URL" ] || [ "$VIDEO_URL" = "null" ]; then
             echo "Missing payload.layout_config.video_url"
             cat payload.json
             exit 1
           fi
-
           OUT_NAME="$(jq -r '.out_name // "output.mp4"' payload.json)"
+          WIDTH="$(jq -r '.width // 1920' payload.json)"
+          HEIGHT="$(jq -r '.height // 1080' payload.json)"
           FPS="$(jq -r '.fps // 30' payload.json)"
           TARGET_MINUTES="$(jq -r '.target_minutes // 20' payload.json)"
-
+          XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
           if [ -z "$TARGET_MINUTES" ] || [ "$TARGET_MINUTES" = "null" ] || [ "$TARGET_MINUTES" -lt 1 ]; then TARGET_MINUTES=20; fi
           TARGET_SEC=$((TARGET_MINUTES*60))
-
-          # Max size 80MB
+          # 80MB max (increased from 50MB)
           MAX_OUTPUT_BYTES=$((80*1024*1024))
-
-          # Force output to 720p
-          OUT_W=1280
-          OUT_H=720
-
-          # Audio settings
-          FINAL_AUDIO_BITRATE_K=128
+          # Audio settings (improved quality)
+          FINAL_AUDIO_BITRATE_K=160
           MUSIC_GAIN=0.9
           BG_GAIN=0.35
-
           # Total kbps budget for MAX_OUTPUT_BYTES over TARGET_SEC (mp4 overhead safety)
-          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.965)}')"
-          if [ "$TOTAL_K_BUDGET" -lt 320 ]; then TOTAL_K_BUDGET=320; fi
-
+          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.95)}')"
+          if [ "$TOTAL_K_BUDGET" -lt 180 ]; then TOTAL_K_BUDGET=180; fi
           VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
-          if [ "$VIDEO_K_BUDGET" -lt 650 ]; then
-            # Improve perceived HD by giving video more bits before touching resolution
-            FINAL_AUDIO_BITRATE_K=96
+          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then
+            FINAL_AUDIO_BITRATE_K=128
             VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
           fi
-          if [ "$VIDEO_K_BUDGET" -lt 650 ]; then VIDEO_K_BUDGET=650; fi
-
+          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then VIDEO_K_BUDGET=60; fi
+          # Quality improvements with better resolution ladder
+          OUT_W="$WIDTH"
+          OUT_H="$HEIGHT"
+          # Adjusted resolution ladder for 80MB budget
+          if [ "$VIDEO_K_BUDGET" -lt 250 ]; then
+            OUT_W=854
+            OUT_H=480
+          elif [ "$VIDEO_K_BUDGET" -lt 500 ]; then
+            OUT_W=1280
+            OUT_H=720
+          fi
           echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
+          echo "WIDTH=$WIDTH" >> $GITHUB_ENV
+          echo "HEIGHT=$HEIGHT" >> $GITHUB_ENV
           echo "FPS=$FPS" >> $GITHUB_ENV
           echo "TARGET_SEC=$TARGET_SEC" >> $GITHUB_ENV
+          echo "XFADE_SEC=$XFADE_SEC" >> $GITHUB_ENV
           echo "MAX_OUTPUT_BYTES=$MAX_OUTPUT_BYTES" >> $GITHUB_ENV
           echo "FINAL_AUDIO_BITRATE_K=$FINAL_AUDIO_BITRATE_K" >> $GITHUB_ENV
           echo "MUSIC_GAIN=$MUSIC_GAIN" >> $GITHUB_ENV
@@ -87,23 +89,19 @@ jobs:
           echo "VIDEO_K_BUDGET=$VIDEO_K_BUDGET" >> $GITHUB_ENV
           echo "OUT_W=$OUT_W" >> $GITHUB_ENV
           echo "OUT_H=$OUT_H" >> $GITHUB_ENV
-
           jq -r '.audio_urls[]? // empty' payload.json > audio_urls.txt || true
-
           echo "Payload ready"
           echo "Target: ${TARGET_SEC}s"
           echo "Max bytes: ${MAX_OUTPUT_BYTES}"
           echo "Total kbps budget: ${TOTAL_K_BUDGET}k"
           echo "Audio kbps: ${FINAL_AUDIO_BITRATE_K}k"
           echo "Video kbps budget: ${VIDEO_K_BUDGET}k"
-          echo "Forced output res: ${OUT_W}x${OUT_H}"
-
+          echo "Chosen output res: ${OUT_W}x${OUT_H}"
       - name: Download source video
         shell: bash
         run: |
           set -euo pipefail
           curl -L --fail --retry 5 --retry-delay 2 "$VIDEO_URL" -o source.mp4
-
       - name: Extract source audio if present
         shell: bash
         run: |
@@ -114,25 +112,26 @@ jobs:
           else
             echo "No source audio stream"
           fi
-
-      - name: Build looped video (720p, 2-pass, better HD look)
+      - name: Build looped video (2-pass, improved quality)
         shell: bash
         run: |
           set -euo pipefail
-
           OUT_W="${OUT_W}"
           OUT_H="${OUT_H}"
           FPS="${FPS}"
           TARGET_SEC="${TARGET_SEC}"
           VIDEO_K="${VIDEO_K_BUDGET}"
-
-          # Mild denoise + unsharp improves perceived "HD" at the same resolution/bitrate.
-          # These are intentionally light to avoid artifacts.
-          VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},fps=${FPS},setsar=1,hqdn3d=1.0:1.0:2.0:2.0,unsharp=5:5:0.6:3:3:0.0"
-
-          # Better compression efficiency than medium, still usually OK within 45m for 20min video
-          X264OPTS="-preset slow -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0"
-
+          # Enhanced filter with denoising for cleaner output
+          VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},hqdn3d=1.5:1.5:6:6,fps=${FPS},setsar=1"
+          # Enhanced x264 options for better quality:
+          # - preset slow: better compression efficiency
+          # - ref=5: more reference frames for better motion prediction
+          # - bframes=3: more B-frames for better compression
+          # - b-adapt=2: optimal B-frame decision mode
+          # - me=umh: uneven multi-hexagon motion estimation (high quality)
+          # - subme=8: high quality subpixel motion estimation
+          # - trellis=2: rate-distortion optimization
+          X264OPTS="-preset slow -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0 -x264-params ref=5:bframes=3:b-adapt=2:direct=auto:me=umh:subme=8:trellis=2"
           # Pass 1
           ffmpeg -y -stream_loop -1 -i source.mp4 \
             -vf "$VF" \
@@ -142,7 +141,6 @@ jobs:
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
             -pass 1 -passlogfile x264pass \
             -f mp4 /dev/null
-
           # Pass 2
           ffmpeg -y -stream_loop -1 -i source.mp4 \
             -vf "$VF" \
@@ -153,36 +151,29 @@ jobs:
             -pass 2 -passlogfile x264pass \
             -movflags +faststart \
             loop_video.mp4
-
           rm -f x264pass.log x264pass.log.mbtree || true
-
       - name: Download and stitch music playlist
         shell: bash
         run: |
           set -euo pipefail
-
           TARGET_SEC="${TARGET_SEC}"
           UA="Mozilla/5.0"
-
           if [ ! -s audio_urls.txt ]; then
             echo "No audio URLs provided, generating silence"
             ffmpeg -y -f lavfi -i anullsrc=channel_layout=stereo:sample_rate=48000 \
               -t "$TARGET_SEC" -c:a pcm_s16le music.wav
             exit 0
           fi
-
           i=0
           while IFS= read -r url; do
             [ -z "$url" ] && continue
             i=$((i+1))
-
             echo "Downloading music $i: $url"
             if ! curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$url" -o "m${i}.bin"; then
               echo "Failed to download $url, skipping"
               i=$((i-1))
               continue
             fi
-
             if ! ffmpeg -y -i "m${i}.bin" -vn -ac 2 -ar 48000 -c:a pcm_s16le "m${i}.wav"; then
               echo "ffmpeg failed for m${i}.bin, skipping"
               rm -f "m${i}.bin"
@@ -190,7 +181,6 @@ jobs:
               continue
             fi
           done < audio_urls.txt
-
           COUNT=$(ls -1 m*.wav 2>/dev/null | wc -l | tr -d ' ')
           if [ "$COUNT" -lt 1 ]; then
             echo "No valid music downloaded, generating silence"
@@ -198,20 +188,16 @@ jobs:
               -t "$TARGET_SEC" -c:a pcm_s16le music.wav
             exit 0
           fi
-
           if [ "$COUNT" -eq 1 ]; then
             ffmpeg -y -stream_loop -1 -i m1.wav -t "$TARGET_SEC" -c:a pcm_s16le music.wav
             exit 0
           fi
-
           INPUTS=()
           for n in $(seq 1 "$COUNT"); do INPUTS+=(-i "m${n}.wav"); done
-
           FILTER=""
           for n in $(seq 0 $((COUNT-1))); do
             FILTER+="[$n:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[a$n];"
           done
-
           FILTER+="[a0][a1]acrossfade=d=1:c1=tri:c2=tri[m1];"
           if [ "$COUNT" -gt 2 ]; then
             for n in $(seq 2 $((COUNT-1))); do
@@ -221,10 +207,8 @@ jobs:
           else
             LAST="m1"
           fi
-
           ffmpeg -y "${INPUTS[@]}" -filter_complex "$FILTER" -map "[$LAST]" playlist.wav
           ffmpeg -y -stream_loop -1 -i playlist.wav -t "$TARGET_SEC" -c:a pcm_s16le music.wav
-
       - name: Mix and enhance audio for clarity
         shell: bash
         run: |
@@ -233,11 +217,9 @@ jobs:
           BG_GAIN="${BG_GAIN}"
           MUSIC_GAIN="${MUSIC_GAIN}"
           AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
-
           CLARITY_FILTER="highpass=f=35,acompressor=threshold=-18dB:ratio=2:attack=15:release=200:makeup=4,equalizer=f=3500:t=q:w=1.0:g=2,loudnorm=I=-16:TP=-1.5:LRA=9"
-
           if [ -f src_audio.m4a ]; then
-            echo "Mixing source ambience + music"
+            echo "Mixing source ambience + music. BG_GAIN=${BG_GAIN}, MUSIC_GAIN=${MUSIC_GAIN}"
             ffmpeg -y \
               -i music.wav \
               -i src_audio.m4a \
@@ -253,89 +235,94 @@ jobs:
               -filter:a "${CLARITY_FILTER}" \
               -t "$TARGET_SEC" -c:a aac -b:a "${AUDIO_K}k" mixed_audio.m4a
           fi
-
       - name: Mux video + audio
         shell: bash
         run: |
           set -euo pipefail
           AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
-
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
             -c:v copy -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT_NAME}"
-
-      - name: Enforce max size 80MB (safety net, keep 720p)
+      - name: Enforce max size 80MB (safety net)
         shell: bash
         run: |
           set -euo pipefail
-
           MAX_BYTES="${MAX_OUTPUT_BYTES}"
           OUT="${OUT_NAME}"
           TARGET_SEC="${TARGET_SEC}"
-
+          AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
           bytes() { stat -c%s "$1"; }
-
           ACTUAL_BYTES=$(bytes "$OUT")
           echo "Output size: $ACTUAL_BYTES bytes, max $MAX_BYTES"
-
           if [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]; then
             echo "OK: under max size"
             exit 0
           fi
-
-          echo "Too large. Retrying with tighter bitrates (still 720p)."
-
+          echo "Too large. Retrying with tighter bitrates and downscale ladder."
           total_k_from_bytes () {
             awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$1" 'BEGIN{
               kbps = (b*8)/(s*1000)*f;
-              if (kbps < 320) kbps = 320;
+              if (kbps < 180) kbps = 180;
               printf("%.0f", kbps);
             }'
           }
-
-          try_encode_720p () {
-            local TOTAL_K="$1"
-            local AUDIOK="$2"
+          audio_floor () {
+            if [ "$1" -lt 64 ]; then echo 64; else echo "$1"; fi
+          }
+          try_encode () {
+            local VF="$1"
+            local TOTAL_K="$2"
+            local AUDIOK="$3"
             local VIDEOK=$(( TOTAL_K - AUDIOK ))
-            if [ "$VIDEOK" -lt 550 ]; then VIDEOK=550; fi
-
-            echo "Re-encode 720p: total=${TOTAL_K}k, video=${VIDEOK}k, audio=${AUDIOK}k"
-
-            ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
-              -map 0:v:0 -map 1:a:0 -shortest \
-              -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
-              -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
-              -c:a aac -b:a "${AUDIOK}k" \
-              -movflags +faststart "${OUT}.tmp.mp4"
-
+            if [ "$VIDEOK" -lt 60 ]; then VIDEOK=60; fi
+            echo "Encode: vf=${VF:-none}, total=${TOTAL_K}k, video=${VIDEOK}k, audio=${AUDIOK}k"
+            if [ -z "$VF" ]; then
+              ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
+                -map 0:v:0 -map 1:a:0 -shortest \
+                -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
+                -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
+                -c:a aac -b:a "${AUDIOK}k" \
+                -movflags +faststart "${OUT}.tmp.mp4"
+            else
+              ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
+                -map 0:v:0 -map 1:a:0 -shortest \
+                -vf "$VF" \
+                -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
+                -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
+                -c:a aac -b:a "${AUDIOK}k" \
+                -movflags +faststart "${OUT}.tmp.mp4"
+            fi
             mv "${OUT}.tmp.mp4" "${OUT}"
             ACTUAL_BYTES=$(bytes "$OUT")
             echo "Size now: $ACTUAL_BYTES bytes"
             [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]
           }
-
-          TOTAL_K=$(total_k_from_bytes 0.955)
-          if try_encode_720p "$TOTAL_K" 128; then
+          TOTAL_K=$(total_k_from_bytes 0.93)
+          if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry1"
             exit 0
           fi
-
-          TOTAL_K=$(total_k_from_bytes 0.965)
-          if try_encode_720p "$TOTAL_K" 96; then
+          AUDIO_K=$(audio_floor 128)
+          TOTAL_K=$(total_k_from_bytes 0.95)
+          if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry2"
             exit 0
           fi
-
-          TOTAL_K=$(total_k_from_bytes 0.975)
-          if try_encode_720p "$TOTAL_K" 80; then
+          AUDIO_K=$(audio_floor 96)
+          TOTAL_K=$(total_k_from_bytes 0.97)
+          if try_encode "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,hqdn3d=1.5:1.5:6:6,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry3"
             exit 0
           fi
-
-          echo "Still above 80MB at 720p. Reduce target_minutes or increase max MB."
+          AUDIO_K=$(audio_floor 64)
+          TOTAL_K=$(total_k_from_bytes 0.99)
+          if try_encode "scale=854:480:force_original_aspect_ratio=increase,crop=854:480,hqdn3d=1.5:1.5:6:6,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
+            echo "OK after retry4"
+            exit 0
+          fi
+          echo "Still above 80MB. Consider lowering target_minutes or accepting smaller resolution."
           exit 1
-
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
