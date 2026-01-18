@@ -14,6 +14,7 @@ jobs:
 
     env:
       # HARD CAP: final mp4 must be under 100 MB
+      # 100,000,000 bytes = 100 MB (decimal). If you want MiB, use 104857600.
       MAX_OUTPUT_BYTES: 100000000
 
       # Final mixed audio bitrate (AAC)
@@ -34,16 +35,6 @@ jobs:
 
       # Xfade between loop segments (seconds)
       DEFAULT_XFADE_SEC: "0.35"
-
-      # Audio perceived-quality helpers (no file size increase)
-      LOUDNORM_I: "-16"
-      LOUDNORM_TP: "-1.5"
-      LOUDNORM_LRA: "11"
-      DITHER: "triangular"
-
-      # AAC encode hints (keeps size same, can help quality)
-      AAC_PROFILE: "aac_low"
-      AAC_CUTOFF_HZ: "16000"
 
     steps:
       - name: Checkout
@@ -128,6 +119,7 @@ jobs:
           SAFETY="${SIZE_SAFETY}"
           AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
 
+          # Total bitrate budget for mp4 (kbps)
           # total_kbps = (max_bytes * 8) / seconds / 1000 * safety
           TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
             kbps = (b*8)/(s*1000)*f;
@@ -289,7 +281,7 @@ jobs:
           ffmpeg -y "${INPUTS[@]}" -filter_complex "$FILTER" -map "[$LAST]" playlist.wav
           ffmpeg -y -stream_loop -1 -i playlist.wav -t "$TARGET_SEC" -c:a pcm_s16le music.wav
 
-      - name: Mix music with source background audio (if present) with higher perceived quality at same bitrate
+      - name: Mix music with source background audio (if present)
         shell: bash
         run: |
           set -euo pipefail
@@ -298,50 +290,20 @@ jobs:
           BG_GAIN="${BG_GAIN}"
           MUSIC_GAIN="${MUSIC_GAIN}"
 
-          LOUDNORM_I="${LOUDNORM_I}"
-          LOUDNORM_TP="${LOUDNORM_TP}"
-          LOUDNORM_LRA="${LOUDNORM_LRA}"
-          DITHER="${DITHER}"
-
-          AAC_PROFILE="${AAC_PROFILE}"
-          AAC_CUTOFF_HZ="${AAC_CUTOFF_HZ}"
-
-          # Notes:
-          # - Filters improve perceived clarity without changing bitrate.
-          # - Dither applies before AAC encode to reduce low-level artifacts.
-          # - Output is already AAC, so later mux should COPY audio.
-
           if [ -f src_audio.m4a ]; then
             echo "Source audio found, mixing with music. BG_GAIN=${BG_GAIN}, MUSIC_GAIN=${MUSIC_GAIN}"
             ffmpeg -y \
               -i music.wav \
               -i src_audio.m4a \
               -filter_complex "\
-                [0:a]volume=${MUSIC_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,highpass=f=35,lowpass=f=${AAC_CUTOFF_HZ}[m]; \
-                [1:a]volume=${BG_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,highpass=f=45,lowpass=f=14000,aloop=loop=-1:size=2000000000[bg]; \
+                [0:a]volume=${MUSIC_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[m]; \
+                [1:a]volume=${BG_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,aloop=loop=-1:size=2000000000[bg]; \
                 [m][bg]amix=inputs=2:duration=first:dropout_transition=2, \
-                acompressor=threshold=-18dB:ratio=2:attack=10:release=120:makeup=2, \
-                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA}, \
-                aresample=48000:dither_method=${DITHER} \
-                [out]" \
-              -map "[out]" -t "$TARGET_SEC" \
-              -c:a aac -profile:a "${AAC_PROFILE}" -cutoff "${AAC_CUTOFF_HZ}" \
-              -b:a "${FINAL_AUDIO_BITRATE_K}k" \
-              mixed_audio.m4a
+                loudnorm=I=-17:TP=-2.0:LRA=11[out]" \
+              -map "[out]" -t "$TARGET_SEC" -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" mixed_audio.m4a
           else
             echo "No source audio, using music only"
-            ffmpeg -y \
-              -i music.wav \
-              -filter_complex "\
-                [0:a]aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,highpass=f=35,lowpass=f=${AAC_CUTOFF_HZ}, \
-                acompressor=threshold=-18dB:ratio=2:attack=10:release=120:makeup=2, \
-                loudnorm=I=${LOUDNORM_I}:TP=${LOUDNORM_TP}:LRA=${LOUDNORM_LRA}, \
-                aresample=48000:dither_method=${DITHER} \
-                [out]" \
-              -map "[out]" -t "$TARGET_SEC" \
-              -c:a aac -profile:a "${AAC_PROFILE}" -cutoff "${AAC_CUTOFF_HZ}" \
-              -b:a "${FINAL_AUDIO_BITRATE_K}k" \
-              mixed_audio.m4a
+            ffmpeg -y -i music.wav -t "$TARGET_SEC" -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" mixed_audio.m4a
           fi
 
       - name: Mux video + mixed audio
@@ -350,8 +312,7 @@ jobs:
           set -euo pipefail
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
-            -c:v copy -c:a copy \
-            -map_metadata -1 \
+            -c:v copy -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" \
             -movflags +faststart "${OUT_NAME}"
 
       - name: Enforce max size 100MB (adaptive, may reduce resolution)
@@ -395,8 +356,7 @@ jobs:
             -map 0:v:0 -map 1:a:0 -shortest \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a copy \
-            -map_metadata -1 \
+            -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
@@ -420,8 +380,7 @@ jobs:
             -vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1" \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a copy \
-            -map_metadata -1 \
+            -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
@@ -445,8 +404,7 @@ jobs:
             -vf "scale=854:480:force_original_aspect_ratio=increase,crop=854:480,setsar=1" \
             -c:v libx264 -preset veryfast \
             -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
-            -c:a copy \
-            -map_metadata -1 \
+            -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT}.tmp.mp4"
 
           mv "${OUT}.tmp.mp4" "${OUT}"
