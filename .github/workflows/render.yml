@@ -13,26 +13,28 @@ jobs:
     timeout-minutes: 90
 
     env:
-      # HARD CAP: final mp4 must be under 250 MB
-      # 250,000,000 bytes = 250 MB (decimal). If you want MiB, use 262144000.
-      MAX_OUTPUT_BYTES: 250000000
+      # HARD CAP: final mp4 must be under 100 MB
+      # 100,000,000 bytes = 100 MB (decimal). If you want MiB, use 104857600.
+      MAX_OUTPUT_BYTES: 100000000
 
-      # Keep music audio modest, then we blend with the source audio at low volume
-      MUSIC_AUDIO_BITRATE_K: 96
+      # Final mixed audio bitrate (AAC)
+      FINAL_AUDIO_BITRATE_K: 64
 
-      # Source (Pexels) background audio bitrate (we re-encode anyway)
-      SRC_AUDIO_BITRATE_K: 64
+      # Source (Pexels) background audio extraction bitrate (AAC)
+      SRC_AUDIO_EXTRACT_BITRATE_K: 48
 
-      # Ratio: source background audio is quieter than music
-      # music_gain=1.0 means unchanged, bg_gain=0.15 means very low background
-      BG_GAIN: "0.15"
+      # Blend: keep source background audio very low, music higher
+      BG_GAIN: "0.12"
       MUSIC_GAIN: "1.00"
 
       # Safety margin so we do not accidentally exceed the cap
-      SIZE_SAFETY: "0.88"
+      SIZE_SAFETY: "0.86"
 
       # Max number of audio files to stitch
       MAX_AUDIO_FILES: "10"
+
+      # Xfade between loop segments (seconds)
+      DEFAULT_XFADE_SEC: "0.35"
 
     steps:
       - name: Checkout
@@ -64,9 +66,12 @@ jobs:
           HEIGHT="$(jq -r '.height // 1080' payload.json)"
           FPS="$(jq -r '.fps // 30' payload.json)"
           TARGET_MINUTES="$(jq -r '.target_minutes // 30' payload.json)"
-          XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
+          XFADE_SEC="$(jq -r '.xfade_sec // env.DEFAULT_XFADE_SEC' payload.json)"
+          if [ -z "$XFADE_SEC" ] || [ "$XFADE_SEC" = "null" ]; then
+            XFADE_SEC="${DEFAULT_XFADE_SEC}"
+          fi
 
-          if [ -z "$VIDEO_URL" ]; then
+          if [ -z "$VIDEO_URL" ] || [ "$VIDEO_URL" = "null" ]; then
             echo "Missing layout_config.video_url in payload.json"
             cat payload.json
             exit 1
@@ -87,7 +92,7 @@ jobs:
           UA="Mozilla/5.0 (X11; Linux x86_64; GH-Actions)"
           curl -L --fail --retry 5 --retry-delay 2 -A "$UA" "$VIDEO_URL" -o source.mp4
 
-      - name: Normalize source video (keep audio as separate optional track)
+      - name: Normalize source video and extract optional background audio
         shell: bash
         run: |
           set -euo pipefail
@@ -95,16 +100,16 @@ jobs:
           # Normalize video to consistent resolution/fps, keep audio out for now
           ffmpeg -y -i source.mp4 \
             -vf "scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,fps=${FPS}" \
-            -an -c:v libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -g $((FPS*2)) norm_video.mp4
+            -an -c:v libx264 -preset veryfast -crf 26 -pix_fmt yuv420p -g $((FPS*2)) norm_video.mp4
 
           # Try extract source audio (may fail if no audio). Never fail the job.
           if ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of csv=p=0 source.mp4 >/dev/null 2>&1; then
-            ffmpeg -y -i source.mp4 -vn -ac 2 -ar 48000 -c:a aac -b:a "${SRC_AUDIO_BITRATE_K}k" src_audio.m4a || true
+            ffmpeg -y -i source.mp4 -vn -ac 2 -ar 48000 -c:a aac -b:a "${SRC_AUDIO_EXTRACT_BITRATE_K}k" src_audio.m4a || true
           else
             echo "No audio stream detected in source.mp4"
           fi
 
-      - name: Compute target bitrates for max file size
+      - name: Compute bitrate budget for max size (100MB)
         shell: bash
         run: |
           set -euo pipefail
@@ -112,33 +117,32 @@ jobs:
           TARGET_SEC=$(awk -v m="$TARGET_MINUTES" 'BEGIN{printf("%.0f", m*60)}')
           MAX_BYTES="${MAX_OUTPUT_BYTES}"
           SAFETY="${SIZE_SAFETY}"
+          AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
 
           # Total bitrate budget for mp4 (kbps)
+          # total_kbps = (max_bytes * 8) / seconds / 1000 * safety
           TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
             kbps = (b*8)/(s*1000)*f;
-            if (kbps < 180) kbps = 180;
+            if (kbps < 120) kbps = 120;
             printf("%.0f", kbps);
           }')
 
-          MUSIC_K="${MUSIC_AUDIO_BITRATE_K}"
-          # We will always output ONE final audio track (mixed), so reserve MUSIC_K for that.
-          VIDEO_K=$(( TOTAL_K - MUSIC_K ))
-          if [ "$VIDEO_K" -lt 120 ]; then
-            VIDEO_K=120
+          VIDEO_K=$(( TOTAL_K - AUDIO_K ))
+          if [ "$VIDEO_K" -lt 60 ]; then
+            VIDEO_K=60
           fi
 
           echo "TARGET_SEC=$TARGET_SEC" >> "$GITHUB_ENV"
           echo "TOTAL_BITRATE_K=$TOTAL_K" >> "$GITHUB_ENV"
           echo "VIDEO_BITRATE_K=$VIDEO_K" >> "$GITHUB_ENV"
-          echo "FINAL_AUDIO_BITRATE_K=$MUSIC_K" >> "$GITHUB_ENV"
 
           echo "Target duration: ${TARGET_SEC}s"
           echo "Max bytes: ${MAX_BYTES}"
           echo "Total target bitrate: ${TOTAL_K} kbps"
           echo "Video bitrate: ${VIDEO_K} kbps"
-          echo "Final audio bitrate: ${MUSIC_K} kbps"
+          echo "Final audio bitrate: ${AUDIO_K} kbps"
 
-      - name: Create looped video (size-capped)
+      - name: Create looped video (initial size-capped encode)
         shell: bash
         run: |
           set -euo pipefail
@@ -293,14 +297,13 @@ jobs:
               -i src_audio.m4a \
               -filter_complex "\
                 [0:a]volume=${MUSIC_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000[m]; \
-                [1:a]volume=${BG_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,aloop=loop=-1:size=2e+09[bg]; \
+                [1:a]volume=${BG_GAIN},aformat=sample_fmts=fltp:channel_layouts=stereo,aresample=48000,aloop=loop=-1:size=2000000000[bg]; \
                 [m][bg]amix=inputs=2:duration=first:dropout_transition=2, \
-                loudnorm=I=-16:TP=-1.5:LRA=11 \
-                [out]" \
-              -map "[out]" -t "$TARGET_SEC" -c:a aac -b:a "${MUSIC_AUDIO_BITRATE_K}k" mixed_audio.m4a
+                loudnorm=I=-17:TP=-2.0:LRA=11[out]" \
+              -map "[out]" -t "$TARGET_SEC" -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" mixed_audio.m4a
           else
             echo "No source audio, using music only"
-            ffmpeg -y -i music.wav -t "$TARGET_SEC" -c:a aac -b:a "${MUSIC_AUDIO_BITRATE_K}k" mixed_audio.m4a
+            ffmpeg -y -i music.wav -t "$TARGET_SEC" -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" mixed_audio.m4a
           fi
 
       - name: Mux video + mixed audio
@@ -309,10 +312,10 @@ jobs:
           set -euo pipefail
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
-            -c:v copy -c:a aac -b:a "${MUSIC_AUDIO_BITRATE_K}k" \
+            -c:v copy -c:a aac -b:a "${FINAL_AUDIO_BITRATE_K}k" \
             -movflags +faststart "${OUT_NAME}"
 
-      - name: Enforce max size 250MB (adaptive re-encode, may reduce resolution)
+      - name: Enforce max size 100MB (adaptive, may reduce resolution)
         shell: bash
         run: |
           set -euo pipefail
@@ -320,6 +323,7 @@ jobs:
           MAX_BYTES="${MAX_OUTPUT_BYTES}"
           OUT="${OUT_NAME}"
           TARGET_SEC="${TARGET_SEC}"
+          AUDIO_K="${FINAL_AUDIO_BITRATE_K}"
 
           bytes() { stat -c%s "$1"; }
 
@@ -331,21 +335,22 @@ jobs:
             exit 0
           fi
 
-          echo "Too large. Applying stricter bitrate, then if needed drop resolution to 1280x720."
+          echo "Too large. Retrying with lower bitrate, then downscale to 1280x720, then 854x480 if needed."
 
-          # Try 1: lower video bitrate aggressively at same resolution
-          SAFETY="0.80"
-          AUDIO_K="${MUSIC_AUDIO_BITRATE_K}"
+          calc_total_k() {
+            awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$1" 'BEGIN{
+              kbps = (b*8)/(s*1000)*f;
+              if (kbps < 110) kbps = 110;
+              printf("%.0f", kbps);
+            }'
+          }
 
-          TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="$SAFETY" 'BEGIN{
-            kbps = (b*8)/(s*1000)*f;
-            if (kbps < 140) kbps = 140;
-            printf("%.0f", kbps);
-          }')
+          # Retry 1: lower bitrate same resolution
+          TOTAL_K=$(calc_total_k 0.78)
           VIDEO_K=$(( TOTAL_K - AUDIO_K ))
-          if [ "$VIDEO_K" -lt 90 ]; then VIDEO_K=90; fi
+          if [ "$VIDEO_K" -lt 45 ]; then VIDEO_K=45; fi
 
-          echo "Retry encode at same res, video ${VIDEO_K}k audio ${AUDIO_K}k"
+          echo "Retry1 encode, video ${VIDEO_K}k audio ${AUDIO_K}k"
 
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
@@ -363,16 +368,12 @@ jobs:
             exit 0
           fi
 
-          # Try 2: reduce resolution to 1280x720 and re-encode
-          echo "Still too large. Downscaling to 1280x720."
-
-          TOTAL_K=$(awk -v b="$MAX_BYTES" -v s="$TARGET_SEC" -v f="0.82" 'BEGIN{
-            kbps = (b*8)/(s*1000)*f;
-            if (kbps < 140) kbps = 140;
-            printf("%.0f", kbps);
-          }')
+          # Retry 2: downscale to 1280x720
+          TOTAL_K=$(calc_total_k 0.82)
           VIDEO_K=$(( TOTAL_K - AUDIO_K ))
-          if [ "$VIDEO_K" -lt 80 ]; then VIDEO_K=80; fi
+          if [ "$VIDEO_K" -lt 40 ]; then VIDEO_K=40; fi
+
+          echo "Retry2 downscale 1280x720, video ${VIDEO_K}k audio ${AUDIO_K}k"
 
           ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
             -map 0:v:0 -map 1:a:0 -shortest \
@@ -386,8 +387,32 @@ jobs:
           ACTUAL_BYTES=$(bytes "$OUT")
           echo "After retry2 size: $ACTUAL_BYTES bytes"
 
+          if [ "$ACTUAL_BYTES" -le "$MAX_BYTES" ]; then
+            echo "OK after retry2"
+            exit 0
+          fi
+
+          # Retry 3: downscale to 854x480 (16:9)
+          TOTAL_K=$(calc_total_k 0.86)
+          VIDEO_K=$(( TOTAL_K - AUDIO_K ))
+          if [ "$VIDEO_K" -lt 35 ]; then VIDEO_K=35; fi
+
+          echo "Retry3 downscale 854x480, video ${VIDEO_K}k audio ${AUDIO_K}k"
+
+          ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
+            -map 0:v:0 -map 1:a:0 -shortest \
+            -vf "scale=854:480:force_original_aspect_ratio=increase,crop=854:480,setsar=1" \
+            -c:v libx264 -preset veryfast \
+            -b:v "${VIDEO_K}k" -maxrate "${VIDEO_K}k" -bufsize "$((VIDEO_K*2))k" \
+            -c:a aac -b:a "${AUDIO_K}k" \
+            -movflags +faststart "${OUT}.tmp.mp4"
+
+          mv "${OUT}.tmp.mp4" "${OUT}"
+          ACTUAL_BYTES=$(bytes "$OUT")
+          echo "After retry3 size: $ACTUAL_BYTES bytes"
+
           if [ "$ACTUAL_BYTES" -gt "$MAX_BYTES" ]; then
-            echo "Still above 250MB. Reduce target_minutes or lower resolution further (e.g., 854x480)."
+            echo "Still above 100MB. Reduce target_minutes or lower resolution further."
             exit 1
           fi
 
