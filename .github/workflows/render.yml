@@ -48,10 +48,10 @@ jobs:
           XFADE_SEC="$(jq -r '.xfade_sec // 0.35' payload.json)"
           if [ -z "$TARGET_MINUTES" ] || [ "$TARGET_MINUTES" = "null" ] || [ "$TARGET_MINUTES" -lt 1 ]; then TARGET_MINUTES=20; fi
           TARGET_SEC=$((TARGET_MINUTES*60))
-          # 80MB max (increased from 50MB)
-          MAX_OUTPUT_BYTES=$((80*1024*1024))
-          # Audio settings (improved quality)
-          FINAL_AUDIO_BITRATE_K=160
+          # 50MB max (reduced from 80MB)
+          MAX_OUTPUT_BYTES=$((50*1024*1024))
+          # Audio settings (slightly reduced for smaller file)
+          FINAL_AUDIO_BITRATE_K=128
           MUSIC_GAIN=0.9
           BG_GAIN=0.35
           # Total kbps budget for MAX_OUTPUT_BYTES over TARGET_SEC (mp4 overhead safety)
@@ -59,18 +59,20 @@ jobs:
           if [ "$TOTAL_K_BUDGET" -lt 180 ]; then TOTAL_K_BUDGET=180; fi
           VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
           if [ "$VIDEO_K_BUDGET" -lt 60 ]; then
-            FINAL_AUDIO_BITRATE_K=128
+            FINAL_AUDIO_BITRATE_K=96
             VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
           fi
           if [ "$VIDEO_K_BUDGET" -lt 60 ]; then VIDEO_K_BUDGET=60; fi
-          # Quality improvements with better resolution ladder
+          # Adjusted resolution ladder for 50MB budget
           OUT_W="$WIDTH"
           OUT_H="$HEIGHT"
-          # Adjusted resolution ladder for 80MB budget
-          if [ "$VIDEO_K_BUDGET" -lt 250 ]; then
+          if [ "$VIDEO_K_BUDGET" -lt 180 ]; then
+            OUT_W=640
+            OUT_H=360
+          elif [ "$VIDEO_K_BUDGET" -lt 300 ]; then
             OUT_W=854
             OUT_H=480
-          elif [ "$VIDEO_K_BUDGET" -lt 500 ]; then
+          elif [ "$VIDEO_K_BUDGET" -lt 450 ]; then
             OUT_W=1280
             OUT_H=720
           fi
@@ -91,8 +93,8 @@ jobs:
           echo "OUT_H=$OUT_H" >> $GITHUB_ENV
           jq -r '.audio_urls[]? // empty' payload.json > audio_urls.txt || true
           echo "Payload ready"
-          echo "Target: ${TARGET_SEC}s"
-          echo "Max bytes: ${MAX_OUTPUT_BYTES}"
+          echo "Target: ${TARGET_SEC}s (${TARGET_MINUTES} minutes)"
+          echo "Max bytes: ${MAX_OUTPUT_BYTES} (50MB)"
           echo "Total kbps budget: ${TOTAL_K_BUDGET}k"
           echo "Audio kbps: ${FINAL_AUDIO_BITRATE_K}k"
           echo "Video kbps budget: ${VIDEO_K_BUDGET}k"
@@ -112,7 +114,7 @@ jobs:
           else
             echo "No source audio stream"
           fi
-      - name: Build looped video (2-pass, improved quality)
+      - name: Build looped video (2-pass, optimized quality)
         shell: bash
         run: |
           set -euo pipefail
@@ -123,15 +125,18 @@ jobs:
           VIDEO_K="${VIDEO_K_BUDGET}"
           # Enhanced filter with denoising for cleaner output
           VF="scale=${OUT_W}:${OUT_H}:force_original_aspect_ratio=increase,crop=${OUT_W}:${OUT_H},hqdn3d=1.5:1.5:6:6,fps=${FPS},setsar=1"
-          # Enhanced x264 options for better quality:
-          # - preset slow: better compression efficiency
-          # - ref=5: more reference frames for better motion prediction
-          # - bframes=3: more B-frames for better compression
+          # Optimized x264 settings for quality at lower bitrate:
+          # - preset slower: better compression efficiency
+          # - tune film: optimized for live-action content
+          # - crf 23: quality target (lower = better, but we constrain with bitrate anyway)
+          # - ref=4: reference frames for motion prediction
+          # - bframes=4: more B-frames for better compression
           # - b-adapt=2: optimal B-frame decision mode
-          # - me=umh: uneven multi-hexagon motion estimation (high quality)
-          # - subme=8: high quality subpixel motion estimation
+          # - me=umh: high-quality motion estimation
+          # - subme=9: highest quality subpixel estimation
           # - trellis=2: rate-distortion optimization
-          X264OPTS="-preset slow -profile:v high -pix_fmt yuv420p -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0 -x264-params ref=5:bframes=3:b-adapt=2:direct=auto:me=umh:subme=8:trellis=2"
+          # - aq-mode=3: adaptive quantization
+          X264OPTS="-preset slower -tune film -profile:v high -pix_fmt yuv420p -crf 23 -g $((FPS*2)) -keyint_min $((FPS*2)) -sc_threshold 0 -x264-params ref=4:bframes=4:b-adapt=2:direct=auto:me=umh:subme=9:trellis=2:aq-mode=3:aq-strength=0.8"
           # Pass 1
           ffmpeg -y -stream_loop -1 -i source.mp4 \
             -vf "$VF" \
@@ -244,7 +249,7 @@ jobs:
             -map 0:v:0 -map 1:a:0 -shortest \
             -c:v copy -c:a aac -b:a "${AUDIO_K}k" \
             -movflags +faststart "${OUT_NAME}"
-      - name: Enforce max size 80MB (safety net)
+      - name: Enforce max size 50MB (safety net)
         shell: bash
         run: |
           set -euo pipefail
@@ -280,7 +285,7 @@ jobs:
             if [ -z "$VF" ]; then
               ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
                 -map 0:v:0 -map 1:a:0 -shortest \
-                -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
+                -c:v libx264 -preset slower -tune film -profile:v high -pix_fmt yuv420p \
                 -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
                 -c:a aac -b:a "${AUDIOK}k" \
                 -movflags +faststart "${OUT}.tmp.mp4"
@@ -288,7 +293,7 @@ jobs:
               ffmpeg -y -i loop_video.mp4 -i mixed_audio.m4a \
                 -map 0:v:0 -map 1:a:0 -shortest \
                 -vf "$VF" \
-                -c:v libx264 -preset slow -profile:v high -pix_fmt yuv420p \
+                -c:v libx264 -preset slower -tune film -profile:v high -pix_fmt yuv420p \
                 -b:v "${VIDEOK}k" -maxrate "${VIDEOK}k" -bufsize "$((VIDEOK*2))k" \
                 -c:a aac -b:a "${AUDIOK}k" \
                 -movflags +faststart "${OUT}.tmp.mp4"
@@ -303,13 +308,13 @@ jobs:
             echo "OK after retry1"
             exit 0
           fi
-          AUDIO_K=$(audio_floor 128)
+          AUDIO_K=$(audio_floor 96)
           TOTAL_K=$(total_k_from_bytes 0.95)
           if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry2"
             exit 0
           fi
-          AUDIO_K=$(audio_floor 96)
+          AUDIO_K=$(audio_floor 80)
           TOTAL_K=$(total_k_from_bytes 0.97)
           if try_encode "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,hqdn3d=1.5:1.5:6:6,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry3"
@@ -321,7 +326,7 @@ jobs:
             echo "OK after retry4"
             exit 0
           fi
-          echo "Still above 80MB. Consider lowering target_minutes or accepting smaller resolution."
+          echo "Still above 50MB. Consider lowering target_minutes or accepting smaller resolution."
           exit 1
       - name: Upload artifact
         uses: actions/upload-artifact@v4
