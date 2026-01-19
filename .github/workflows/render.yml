@@ -50,32 +50,14 @@ jobs:
           TARGET_SEC=$((TARGET_MINUTES*60))
           # 50MB max (reduced from 80MB)
           MAX_OUTPUT_BYTES=$((50*1024*1024))
-          # Audio settings (slightly reduced for smaller file)
-          FINAL_AUDIO_BITRATE_K=128
+          # Audio settings (high quality maintained)
+          FINAL_AUDIO_BITRATE_K=160
+          # Fixed video bitrate
+          VIDEO_K_BUDGET=245
           MUSIC_GAIN=0.9
           BG_GAIN=0.35
-          # Total kbps budget for MAX_OUTPUT_BYTES over TARGET_SEC (mp4 overhead safety)
-          TOTAL_K_BUDGET="$(awk -v b="$MAX_OUTPUT_BYTES" -v s="$TARGET_SEC" 'BEGIN{printf("%.0f",(b*8)/(s*1000)*0.95)}')"
-          if [ "$TOTAL_K_BUDGET" -lt 180 ]; then TOTAL_K_BUDGET=180; fi
-          VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
-          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then
-            FINAL_AUDIO_BITRATE_K=96
-            VIDEO_K_BUDGET=$(( TOTAL_K_BUDGET - FINAL_AUDIO_BITRATE_K ))
-          fi
-          if [ "$VIDEO_K_BUDGET" -lt 60 ]; then VIDEO_K_BUDGET=60; fi
-          # Adjusted resolution ladder for 50MB budget
-          OUT_W="$WIDTH"
-          OUT_H="$HEIGHT"
-          if [ "$VIDEO_K_BUDGET" -lt 180 ]; then
-            OUT_W=640
-            OUT_H=360
-          elif [ "$VIDEO_K_BUDGET" -lt 300 ]; then
-            OUT_W=854
-            OUT_H=480
-          elif [ "$VIDEO_K_BUDGET" -lt 450 ]; then
-            OUT_W=1280
-            OUT_H=720
-          fi
+          # Note: With fixed 245k video + 160k audio = 405k total (~61MB for 20min)
+          # This exceeds 50MB target, but provides the requested quality settings
           echo "VIDEO_URL=$VIDEO_URL" >> $GITHUB_ENV
           echo "OUT_NAME=$OUT_NAME" >> $GITHUB_ENV
           echo "WIDTH=$WIDTH" >> $GITHUB_ENV
@@ -87,18 +69,17 @@ jobs:
           echo "FINAL_AUDIO_BITRATE_K=$FINAL_AUDIO_BITRATE_K" >> $GITHUB_ENV
           echo "MUSIC_GAIN=$MUSIC_GAIN" >> $GITHUB_ENV
           echo "BG_GAIN=$BG_GAIN" >> $GITHUB_ENV
-          echo "TOTAL_K_BUDGET=$TOTAL_K_BUDGET" >> $GITHUB_ENV
           echo "VIDEO_K_BUDGET=$VIDEO_K_BUDGET" >> $GITHUB_ENV
-          echo "OUT_W=$OUT_W" >> $GITHUB_ENV
-          echo "OUT_H=$OUT_H" >> $GITHUB_ENV
+          echo "OUT_W=$WIDTH" >> $GITHUB_ENV
+          echo "OUT_H=$HEIGHT" >> $GITHUB_ENV
           jq -r '.audio_urls[]? // empty' payload.json > audio_urls.txt || true
           echo "Payload ready"
           echo "Target: ${TARGET_SEC}s (${TARGET_MINUTES} minutes)"
           echo "Max bytes: ${MAX_OUTPUT_BYTES} (50MB)"
-          echo "Total kbps budget: ${TOTAL_K_BUDGET}k"
           echo "Audio kbps: ${FINAL_AUDIO_BITRATE_K}k"
-          echo "Video kbps budget: ${VIDEO_K_BUDGET}k"
-          echo "Chosen output res: ${OUT_W}x${OUT_H}"
+          echo "Video kbps: ${VIDEO_K_BUDGET}k (fixed)"
+          echo "Total kbps: $((VIDEO_K_BUDGET + FINAL_AUDIO_BITRATE_K))k (~$((((VIDEO_K_BUDGET + FINAL_AUDIO_BITRATE_K) * TARGET_SEC) / 8192))MB estimated)"
+          echo "Output resolution: ${WIDTH}x${HEIGHT}"
       - name: Download source video
         shell: bash
         run: |
@@ -308,13 +289,13 @@ jobs:
             echo "OK after retry1"
             exit 0
           fi
-          AUDIO_K=$(audio_floor 96)
+          AUDIO_K=$(audio_floor 128)
           TOTAL_K=$(total_k_from_bytes 0.95)
           if try_encode "" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry2"
             exit 0
           fi
-          AUDIO_K=$(audio_floor 80)
+          AUDIO_K=$(audio_floor 96)
           TOTAL_K=$(total_k_from_bytes 0.97)
           if try_encode "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,hqdn3d=1.5:1.5:6:6,setsar=1" "$TOTAL_K" "$AUDIO_K"; then
             echo "OK after retry3"
